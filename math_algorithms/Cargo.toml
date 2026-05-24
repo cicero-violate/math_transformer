@@ -1,0 +1,8 @@
+[package]
+name = "math-algorithms"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "math_algorithms"
+path = "src/lib.rs"
