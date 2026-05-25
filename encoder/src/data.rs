@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 ///   value_target   — ground-truth score from the verifier ∈ [0, 1]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrainExample {
-    pub tokens:        Vec<u32>,
+    pub tokens: Vec<u32>,
     pub policy_target: Vec<f32>,
-    pub value_target:  f32,
+    pub value_target: f32,
 }
 
 /// Load a JSONL file of TrainExamples.
@@ -23,8 +23,8 @@ pub fn load_jsonl(path: &std::path::Path) -> Result<Vec<TrainExample>> {
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
-        let ex: TrainExample = serde_json::from_str(line)
-            .map_err(|e| anyhow::anyhow!("line {}: {e}", i + 1))?;
+        let ex: TrainExample =
+            serde_json::from_str(line).map_err(|e| anyhow::anyhow!("line {}: {e}", i + 1))?;
         examples.push(ex);
     }
     Ok(examples)
@@ -48,12 +48,18 @@ pub fn collate(
     max_len: usize,
     pad_id: u32,
 ) -> (Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<f32>) {
-    let seq_len = examples.iter().map(|e| e.tokens.len()).max().unwrap_or(0).min(max_len);
+    let seq_len = examples
+        .iter()
+        .map(|e| e.tokens.len())
+        .max()
+        .unwrap_or(0)
+        .min(max_len);
     let tokens: Vec<Vec<u32>> = examples
         .iter()
         .map(|e| pad_tokens(&e.tokens, seq_len, pad_id))
         .collect();
-    let max_policy_len = examples.iter()
+    let max_policy_len = examples
+        .iter()
         .map(|e| e.policy_target.len())
         .max()
         .unwrap_or(0);

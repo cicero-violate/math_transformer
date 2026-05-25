@@ -6,7 +6,10 @@ pub struct DisjointSet {
 
 impl DisjointSet {
     pub fn new(n: usize) -> Self {
-        Self { parent: (0..n).collect(), rank: vec![0; n] }
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
     }
 
     pub fn find(&mut self, x: usize) -> usize {

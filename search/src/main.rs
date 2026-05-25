@@ -10,7 +10,9 @@ use search::op::Op;
 use search::policy::{Candidate, CandidateGen, NoisyTemplatePolicy, Policy};
 use search::search::{Mcts, MctsConfig, NodeRecord};
 use search::state::RepoState;
-use search::value::{ConstantValue, DepthValue, Value, VerifierCache, VerifyMode, VerifyValue};
+use search::value::{
+    ConstantValue, DepthValue, JudgementDeltaValue, Value, VerifierCache, VerifyMode, VerifyValue,
+};
 
 #[derive(Parser)]
 #[command(about = "MCTS-based neurosymbolic code search")]
@@ -30,9 +32,29 @@ struct Cli {
     #[arg(long, default_value_t = 1.5)]
     c_puct: f32,
 
-    /// Value function: stub | depth | check | test | composite | encoder.
+    /// Value function: stub | depth | check | test | composite | encoder | judgement-delta.
     #[arg(long, default_value = "stub")]
     value: String,
+
+    /// Baseline judgement.jsonl snapshot taken before any edits.
+    /// Required when --value judgement-delta.
+    #[arg(long)]
+    baseline_judgement: Option<PathBuf>,
+
+    /// Path to the canon-rustc-v3 binary (used as RUSTC_WRAPPER).
+    /// Required when --value judgement-delta.
+    #[arg(long, default_value = "canon-rustc-v3")]
+    canon_bin: PathBuf,
+
+    /// Path to the judgement binary.
+    /// Required when --value judgement-delta.
+    #[arg(long, default_value = "judgement")]
+    judgement_bin: PathBuf,
+
+    /// Rustc crate target name, e.g. "ai". Determines the artifact subdir.
+    /// Required when --value judgement-delta.
+    #[arg(long)]
+    crate_name: Option<String>,
 
     /// Static op template file (JSONL). Ignored when --dynamic is set.
     #[arg(long)]
@@ -99,8 +121,11 @@ fn main() -> Result<()> {
     let policy_is_dynamic = cli.dynamic;
     let max_cands = cli.max_candidates;
     let templates = load_templates(cli.templates.as_deref())?;
-    let encoder_n_ops = cli.encoder_n_ops
-        .unwrap_or(if policy_is_dynamic { max_cands } else { templates.len() });
+    let encoder_n_ops = cli.encoder_n_ops.unwrap_or(if policy_is_dynamic {
+        max_cands
+    } else {
+        templates.len()
+    });
     let encoder = load_encoder(
         cli.encoder_weights.as_deref(),
         cli.encoder_vocab.as_deref(),
@@ -112,47 +137,170 @@ fn main() -> Result<()> {
     match cli.value.as_str() {
         "stub" => {
             if let Some(infer) = encoder.clone() {
-                run_with!(EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)), ConstantValue(0.5));
+                run_with!(
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
+                    ConstantValue(0.5)
+                );
             } else if policy_is_dynamic {
-                run_with!(CandidateGen { max_candidates: max_cands }, ConstantValue(0.5));
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    ConstantValue(0.5)
+                );
             } else {
-                run_with!(NoisyTemplatePolicy { templates, alpha: 0.3 }, ConstantValue(0.5));
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    ConstantValue(0.5)
+                );
             }
         }
         "depth" => {
-            let v = DepthValue { max_depth: cli.max_depth };
+            let v = DepthValue {
+                max_depth: cli.max_depth,
+            };
             if let Some(infer) = encoder.clone() {
-                run_with!(EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)), v);
+                run_with!(
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
+                    v
+                );
             } else if policy_is_dynamic {
-                run_with!(CandidateGen { max_candidates: max_cands }, v);
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    v
+                );
             } else {
-                run_with!(NoisyTemplatePolicy { templates, alpha: 0.3 }, v);
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    v
+                );
             }
         }
         "check" => {
-            let v = verify_value(cli.editor_bin.clone(), VerifyMode::Check, cache_path.clone());
+            let v = verify_value(
+                cli.editor_bin.clone(),
+                VerifyMode::Check,
+                cache_path.clone(),
+            );
             if let Some(infer) = encoder.clone() {
-                run_with!(EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)), v);
+                run_with!(
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
+                    v
+                );
             } else if policy_is_dynamic {
-                run_with!(CandidateGen { max_candidates: max_cands }, v);
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    v
+                );
             } else {
-                run_with!(NoisyTemplatePolicy { templates, alpha: 0.3 }, v);
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    v
+                );
             }
         }
         "test" => {
             let v = verify_value(cli.editor_bin.clone(), VerifyMode::Test, cache_path.clone());
             if let Some(infer) = encoder.clone() {
-                run_with!(EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)), v);
+                run_with!(
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
+                    v
+                );
             } else if policy_is_dynamic {
-                run_with!(CandidateGen { max_candidates: max_cands }, v);
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    v
+                );
             } else {
-                run_with!(NoisyTemplatePolicy { templates, alpha: 0.3 }, v);
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    v
+                );
             }
         }
         "composite" => {
-            let v = verify_value(cli.editor_bin.clone(), VerifyMode::Composite, cache_path.clone());
+            let v = verify_value(
+                cli.editor_bin.clone(),
+                VerifyMode::Composite,
+                cache_path.clone(),
+            );
             if let Some(infer) = encoder.clone() {
-                run_with!(EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)), v);
+                run_with!(
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
+                    v
+                );
+            } else if policy_is_dynamic {
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    v
+                );
+            } else {
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    v
+                );
+            }
+        }
+        "judgement-delta" => {
+            let baseline = cli
+                .baseline_judgement
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--baseline-judgement required with --value judgement-delta"))?;
+            let crate_name = cli
+                .crate_name
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--crate-name required with --value judgement-delta"))?;
+            let v = judgement_delta_value(
+                cli.editor_bin.clone(),
+                baseline,
+                cli.canon_bin.clone(),
+                cli.judgement_bin.clone(),
+                crate_name,
+                cache_path.clone(),
+            );
+            if let Some(infer) = encoder.clone() {
+                run_with!(
+                    EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)),
+                    v
+                );
             } else if policy_is_dynamic {
                 run_with!(CandidateGen { max_candidates: max_cands }, v);
             } else {
@@ -164,7 +312,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("--value encoder requires --encoder-weights and --encoder-vocab");
             };
             run_with!(
-                EncPolicy::new(infer.clone(), policy_source(policy_is_dynamic, max_cands, templates)),
+                EncPolicy::new(
+                    infer.clone(),
+                    policy_source(policy_is_dynamic, max_cands, templates)
+                ),
                 EncValue { inner: infer }
             );
         }
@@ -178,6 +329,24 @@ fn verify_value(editor_bin: PathBuf, mode: VerifyMode, cache_path: Option<PathBu
     VerifyValue {
         editor_bin,
         mode,
+        cache: cache_path.map(VerifierCache::load),
+    }
+}
+
+fn judgement_delta_value(
+    editor_bin: PathBuf,
+    baseline_judgement: PathBuf,
+    canon_bin: PathBuf,
+    judgement_bin: PathBuf,
+    crate_name: String,
+    cache_path: Option<PathBuf>,
+) -> JudgementDeltaValue {
+    JudgementDeltaValue {
+        editor_bin,
+        baseline_judgement,
+        canon_bin,
+        judgement_bin,
+        crate_name,
         cache: cache_path.map(VerifierCache::load),
     }
 }
@@ -210,11 +379,13 @@ impl EncPolicy {
 impl Policy for EncPolicy {
     fn propose(&self, state: &RepoState) -> Vec<Candidate> {
         let templates = match &self.source {
-            PolicySource::Dynamic { max_candidates } => CandidateGen { max_candidates: *max_candidates }
-                .propose(state)
-                .into_iter()
-                .map(|c| c.op)
-                .collect(),
+            PolicySource::Dynamic { max_candidates } => CandidateGen {
+                max_candidates: *max_candidates,
+            }
+            .propose(state)
+            .into_iter()
+            .map(|c| c.op)
+            .collect(),
             PolicySource::Static(templates) => templates.clone(),
         };
         if templates.is_empty() {
@@ -229,7 +400,8 @@ impl Policy for EncPolicy {
         let history: Vec<String> = state.ops.iter().map(|op| op.to_string()).collect();
         let history_refs: Vec<&str> = history.iter().map(|op| op.as_str()).collect();
 
-        let priors = self.inner
+        let priors = self
+            .inner
             .run(&files, &history_refs, &templates)
             .map(|(priors, _)| priors)
             .unwrap_or_else(|err| {
@@ -241,7 +413,10 @@ impl Policy for EncPolicy {
         templates
             .into_iter()
             .enumerate()
-            .map(|(i, op)| Candidate { op, prior: priors.get(i).copied().unwrap_or(fallback) })
+            .map(|(i, op)| Candidate {
+                op,
+                prior: priors.get(i).copied().unwrap_or(fallback),
+            })
             .collect()
     }
 }
@@ -284,7 +459,8 @@ fn read_state_files(root: &std::path::Path) -> Vec<(String, String)> {
         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
         }
-        let rel = entry.path()
+        let rel = entry
+            .path()
             .strip_prefix(root)
             .unwrap_or(entry.path())
             .to_string_lossy()
@@ -304,10 +480,18 @@ fn load_encoder(
 ) -> Result<Option<Arc<EncoderInfer>>> {
     match (weights, vocab) {
         (None, None) => Ok(None),
-        (Some(_), None) => anyhow::bail!("--encoder-vocab is required when --encoder-weights is set"),
-        (None, Some(_)) => anyhow::bail!("--encoder-weights is required when --encoder-vocab is set"),
+        (Some(_), None) => {
+            anyhow::bail!("--encoder-vocab is required when --encoder-weights is set")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("--encoder-weights is required when --encoder-vocab is set")
+        }
         (Some(weights), Some(vocab)) => {
-            let mut cfg = if small { EncoderConfig::small() } else { EncoderConfig::default() };
+            let mut cfg = if small {
+                EncoderConfig::small()
+            } else {
+                EncoderConfig::default()
+            };
             cfg.n_ops = n_ops;
             Ok(Some(Arc::new(EncoderInfer::load(weights, vocab, cfg)?)))
         }
@@ -327,7 +511,11 @@ fn run<P: search::policy::Policy, V: search::value::Value>(
     for (op, p) in &probs {
         eprintln!("  {:.4}  {}", p, op);
     }
-    eprintln!("Root value: {:.4}  |  tree nodes: {}", root_value, mcts.tree.len());
+    eprintln!(
+        "Root value: {:.4}  |  tree nodes: {}",
+        root_value,
+        mcts.tree.len()
+    );
 
     let seq = mcts.best_sequence(root, seq_len);
     println!("Best sequence ({} steps):", seq.len());
@@ -337,7 +525,11 @@ fn run<P: search::policy::Policy, V: search::value::Value>(
 
     if let Some(path) = dump {
         let records = mcts.node_records();
-        eprintln!("Dumping {} node records → {}", records.len(), path.display());
+        eprintln!(
+            "Dumping {} node records → {}",
+            records.len(),
+            path.display()
+        );
         if let Err(e) = write_records(path, &records) {
             eprintln!("warn: dump failed: {e}");
         }
@@ -347,10 +539,11 @@ fn run<P: search::policy::Policy, V: search::value::Value>(
 fn write_records(path: &std::path::Path, records: &[NodeRecord]) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
-        .create(true).append(true).open(path)?;
+        .create(true)
+        .append(true)
+        .open(path)?;
     for rec in records {
-        let op_history: Vec<String> = rec.state.ops.iter()
-            .map(|o| o.to_string()).collect();
+        let op_history: Vec<String> = rec.state.ops.iter().map(|o| o.to_string()).collect();
         let policy: Vec<f32> = rec.policy.iter().map(|(_, p)| *p).collect();
         let record = serde_json::json!({
             "root":       rec.state.root.to_string_lossy(),
@@ -364,12 +557,16 @@ fn write_records(path: &std::path::Path, records: &[NodeRecord]) -> Result<()> {
 }
 
 fn load_templates(path: Option<&std::path::Path>) -> Result<Vec<search::op::Op>> {
-    let Some(p) = path else { return Ok(Vec::new()); };
+    let Some(p) = path else {
+        return Ok(Vec::new());
+    };
     let content = std::fs::read_to_string(p)?;
     let mut ops = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with("//") { continue; }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
         ops.push(serde_json::from_str(line)?);
     }
     Ok(ops)

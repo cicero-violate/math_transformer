@@ -7,10 +7,10 @@ use crate::data::{collate, TrainExample};
 use crate::model::EncoderModel;
 
 pub struct TrainConfig {
-    pub lr:          f64,
-    pub batch_size:  usize,
-    pub epochs:      usize,
-    pub device:      Device,
+    pub lr: f64,
+    pub batch_size: usize,
+    pub epochs: usize,
+    pub device: Device,
     /// Weight on value loss relative to policy loss (total = policy + λ·value).
     pub value_lambda: f64,
 }
@@ -18,19 +18,19 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            lr:           1e-4,
-            batch_size:   32,
-            epochs:       10,
-            device:       Device::Cpu,
+            lr: 1e-4,
+            batch_size: 32,
+            epochs: 10,
+            device: Device::Cpu,
             value_lambda: 1.0,
         }
     }
 }
 
 pub struct Trainer {
-    pub model:    EncoderModel,
-    pub varmap:   VarMap,
-    pub cfg:      EncoderConfig,
+    pub model: EncoderModel,
+    pub varmap: VarMap,
+    pub cfg: EncoderConfig,
     pub train_cfg: TrainConfig,
 }
 
@@ -39,7 +39,12 @@ impl Trainer {
         let varmap = VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &train_cfg.device);
         let model = EncoderModel::new(&cfg, vb)?;
-        Ok(Self { model, varmap, cfg, train_cfg })
+        Ok(Self {
+            model,
+            varmap,
+            cfg,
+            train_cfg,
+        })
     }
 
     /// Load an existing checkpoint into this trainer before training resumes.
@@ -51,7 +56,10 @@ impl Trainer {
     pub fn train(&mut self, data: &[TrainExample]) -> Result<()> {
         let mut opt = AdamW::new(
             self.varmap.all_vars(),
-            ParamsAdamW { lr: self.train_cfg.lr, ..Default::default() },
+            ParamsAdamW {
+                lr: self.train_cfg.lr,
+                ..Default::default()
+            },
         )?;
 
         let n = data.len();

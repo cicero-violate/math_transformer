@@ -1,25 +1,25 @@
 use candle_core::{Result, Tensor};
-use candle_nn::{linear_no_bias, LayerNorm, Linear, Module, VarBuilder, layer_norm};
+use candle_nn::{layer_norm, linear_no_bias, LayerNorm, Linear, Module, VarBuilder};
 
 use super::attention::MultiHeadAttention;
 
 /// Pre-norm transformer encoder layer.
 ///   x → norm1 → MHA → residual → norm2 → FFN → residual
 pub struct EncoderLayer {
-    attn:  MultiHeadAttention,
+    attn: MultiHeadAttention,
     norm1: LayerNorm,
-    ff1:   Linear,
-    ff2:   Linear,
+    ff1: Linear,
+    ff2: Linear,
     norm2: LayerNorm,
 }
 
 impl EncoderLayer {
     pub fn new(d_model: usize, n_heads: usize, d_ff: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            attn:  MultiHeadAttention::new(d_model, n_heads, vb.pp("attn"))?,
+            attn: MultiHeadAttention::new(d_model, n_heads, vb.pp("attn"))?,
             norm1: layer_norm(d_model, 1e-5, vb.pp("norm1"))?,
-            ff1:   linear_no_bias(d_model, d_ff,    vb.pp("ff1"))?,
-            ff2:   linear_no_bias(d_ff,    d_model, vb.pp("ff2"))?,
+            ff1: linear_no_bias(d_model, d_ff, vb.pp("ff1"))?,
+            ff2: linear_no_bias(d_ff, d_model, vb.pp("ff2"))?,
             norm2: layer_norm(d_model, 1e-5, vb.pp("norm2"))?,
         })
     }

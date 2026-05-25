@@ -1,5 +1,5 @@
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use crate::op::Op;
@@ -17,7 +17,10 @@ pub struct RepoState {
 
 impl RepoState {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, ops: Vec::new() }
+        Self {
+            root,
+            ops: Vec::new(),
+        }
     }
 
     /// Return a child state with `op` appended.

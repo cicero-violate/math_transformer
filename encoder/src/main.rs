@@ -20,42 +20,60 @@ struct Cli {
 enum Cmd {
     /// Build a token vocabulary from all .rs files under a directory.
     BuildVocab {
-        #[arg(long)] src_dir:    PathBuf,
-        #[arg(long)] out:        PathBuf,
-        #[arg(long, default_value_t = 8192)] vocab_size: usize,
+        #[arg(long)]
+        src_dir: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 8192)]
+        vocab_size: usize,
     },
 
     /// Convert raw search dump (JSONL from `search --dump`) into tokenised
     /// TrainExample JSONL ready for `encoder train`.
     Collect {
         /// Raw JSONL written by `search --dump`.
-        #[arg(long)] raw:   PathBuf,
+        #[arg(long)]
+        raw: PathBuf,
         /// Vocabulary JSON built by `encoder build-vocab`.
-        #[arg(long)] vocab: PathBuf,
+        #[arg(long)]
+        vocab: PathBuf,
         /// Output path for tokenised TrainExample JSONL.
-        #[arg(long)] out:   PathBuf,
+        #[arg(long)]
+        out: PathBuf,
         /// Max sequence length (tokens); must match training config.
-        #[arg(long, default_value_t = 2048)] max_len: usize,
+        #[arg(long, default_value_t = 2048)]
+        max_len: usize,
         /// Token ID used for padding.
-        #[arg(long, default_value_t = 0)] pad_id: u32,
+        #[arg(long, default_value_t = 0)]
+        pad_id: u32,
     },
 
     /// Train the encoder on a tokenised TrainExample JSONL dataset.
     Train {
-        #[arg(long)] data:        PathBuf,
-        #[arg(long)] out:         PathBuf,
-        #[arg(long, default_value_t = 1e-4)]  lr:           f64,
-        #[arg(long, default_value_t = 32)]    batch_size:   usize,
-        #[arg(long, default_value_t = 10)]    epochs:       usize,
-        #[arg(long, default_value_t = 1.0)]   value_lambda: f64,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 1e-4)]
+        lr: f64,
+        #[arg(long, default_value_t = 32)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 10)]
+        epochs: usize,
+        #[arg(long, default_value_t = 1.0)]
+        value_lambda: f64,
         /// Use small preset (4 layers, d=256) instead of default (6L, d=512).
-        #[arg(long)] small: bool,
+        #[arg(long)]
+        small: bool,
         /// Must match the number of op templates used during data collection, or `auto`.
-        #[arg(long, default_value = "auto")] n_ops: String,
+        #[arg(long, default_value = "auto")]
+        n_ops: String,
         /// Training device: auto | cpu | cuda | metal.
-        #[arg(long, value_enum, default_value_t = DeviceArg::Auto)] device: DeviceArg,
+        #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
         /// Existing safetensors checkpoint to load before continuing training.
-        #[arg(long)] resume: Option<PathBuf>,
+        #[arg(long)]
+        resume: Option<PathBuf>,
     },
 }
 
@@ -70,14 +88,28 @@ enum DeviceArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::BuildVocab { src_dir, out, vocab_size } => {
+        Cmd::BuildVocab {
+            src_dir,
+            out,
+            vocab_size,
+        } => {
             let corpus = collect_corpus(&src_dir)?;
             let tok = CodeTokenizer::build_vocab(&corpus, vocab_size);
             std::fs::write(&out, tok.to_json())?;
-            eprintln!("Vocabulary ({} tokens) → {}", tok.vocab_size(), out.display());
+            eprintln!(
+                "Vocabulary ({} tokens) → {}",
+                tok.vocab_size(),
+                out.display()
+            );
         }
 
-        Cmd::Collect { raw, vocab, out, max_len, pad_id } => {
+        Cmd::Collect {
+            raw,
+            vocab,
+            out,
+            max_len,
+            pad_id,
+        } => {
             let vocab_json = std::fs::read_to_string(&vocab)?;
             let tok = CodeTokenizer::from_json(&vocab_json)?;
 
@@ -89,35 +121,45 @@ fn main() -> Result<()> {
 
             for (lineno, line) in raw_text.lines().enumerate() {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
 
                 let rec: serde_json::Value = serde_json::from_str(line)
                     .map_err(|e| anyhow::anyhow!("line {}: {e}", lineno + 1))?;
 
-                let root = rec["root"].as_str()
+                let root = rec["root"]
+                    .as_str()
                     .ok_or_else(|| anyhow::anyhow!("line {}: missing root", lineno + 1))?;
-                let policy_raw = rec["policy"].as_array()
+                let policy_raw = rec["policy"]
+                    .as_array()
                     .ok_or_else(|| anyhow::anyhow!("line {}: missing policy", lineno + 1))?;
-                let value_target = rec["value"].as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("line {}: missing value", lineno + 1))? as f32;
+                let value_target = rec["value"]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("line {}: missing value", lineno + 1))?
+                    as f32;
 
-                let policy_target: Vec<f32> = policy_raw.iter()
+                let policy_target: Vec<f32> = policy_raw
+                    .iter()
                     .map(|v| v.as_f64().unwrap_or(0.0) as f32)
                     .collect();
 
                 // Op history applied to reach this state (may be empty for root).
                 let op_history: Vec<String> = rec["op_history"]
                     .as_array()
-                    .map(|arr| arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let op_refs: Vec<&str> = op_history.iter().map(|s| s.as_str()).collect();
 
                 // Read all .rs files from the crate root.
                 let root_path = std::path::Path::new(root);
                 let files = read_rs_files(root_path)?;
-                let file_refs: Vec<(&str, &str)> = files.iter()
+                let file_refs: Vec<(&str, &str)> = files
+                    .iter()
                     .map(|(p, c)| (p.as_str(), c.as_str()))
                     .collect();
 
@@ -125,7 +167,11 @@ fn main() -> Result<()> {
                 // Pad to max_len.
                 ids.resize(max_len, pad_id);
 
-                let example = TrainExample { tokens: ids, policy_target, value_target };
+                let example = TrainExample {
+                    tokens: ids,
+                    policy_target,
+                    value_target,
+                };
                 writeln!(outfile, "{}", serde_json::to_string(&example)?)?;
                 count += 1;
             }
@@ -133,11 +179,26 @@ fn main() -> Result<()> {
             eprintln!("{count} examples → {}", out.display());
         }
 
-        Cmd::Train { data, out, lr, batch_size, epochs, value_lambda, small, n_ops, device, resume } => {
+        Cmd::Train {
+            data,
+            out,
+            lr,
+            batch_size,
+            epochs,
+            value_lambda,
+            small,
+            n_ops,
+            device,
+            resume,
+        } => {
             let examples = load_jsonl(&data)?;
             eprintln!("Loaded {} training examples", examples.len());
 
-            let mut cfg = if small { EncoderConfig::small() } else { EncoderConfig::default() };
+            let mut cfg = if small {
+                EncoderConfig::small()
+            } else {
+                EncoderConfig::default()
+            };
             cfg.n_ops = resolve_n_ops(&n_ops, &examples)?;
             cfg.vocab_size = cfg.vocab_size.max(infer_vocab_size(&examples));
             warn_policy_lengths(&examples, cfg.n_ops);
@@ -151,7 +212,8 @@ fn main() -> Result<()> {
             };
             let mut trainer = Trainer::new(cfg, train_cfg)?;
             if let Some(path) = resume {
-                trainer.load(&path)
+                trainer
+                    .load(&path)
                     .with_context(|| format!("failed to load checkpoint {}", path.display()))?;
                 eprintln!("Resumed from {}", path.display());
             }
@@ -170,11 +232,15 @@ fn read_rs_files(root: &std::path::Path) -> Result<Vec<(String, String)>> {
     for entry in walkdir::WalkDir::new(root).min_depth(1) {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy();
-        if name == "target" || name.starts_with('.') { continue; }
+        if name == "target" || name.starts_with('.') {
+            continue;
+        }
         if entry.file_type().is_file()
             && entry.path().extension().and_then(|e| e.to_str()) == Some("rs")
         {
-            let rel = entry.path().strip_prefix(root)
+            let rel = entry
+                .path()
+                .strip_prefix(root)
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .into_owned();
@@ -204,9 +270,9 @@ fn resolve_n_ops(value: &str, examples: &[TrainExample]) -> Result<usize> {
             .filter(|n| *n > 0)
             .ok_or_else(|| anyhow::anyhow!("cannot infer --n-ops from empty policy targets"));
     }
-    value
-        .parse::<usize>()
-        .with_context(|| format!("invalid --n-ops value `{value}`; use a positive integer or `auto`"))
+    value.parse::<usize>().with_context(|| {
+        format!("invalid --n-ops value `{value}`; use a positive integer or `auto`")
+    })
 }
 
 fn warn_policy_lengths(examples: &[TrainExample], n_ops: usize) {

@@ -56,7 +56,8 @@ pub fn topological_sort(graph: &[Vec<usize>]) -> Option<Vec<usize>> {
             indegree[v] += 1;
         }
     }
-    let mut queue: VecDeque<usize> = indegree.iter()
+    let mut queue: VecDeque<usize> = indegree
+        .iter()
         .enumerate()
         .filter_map(|(i, &d)| (d == 0).then_some(i))
         .collect();
@@ -209,13 +210,41 @@ mod tests {
 
     #[test]
     fn graph_basics_work() {
-        let g = vec![vec![(1, 4), (2, 1)], vec![(3, 1)], vec![(1, 2), (3, 5)], vec![]];
+        let g = vec![
+            vec![(1, 4), (2, 1)],
+            vec![(3, 1)],
+            vec![(1, 2), (3, 5)],
+            vec![],
+        ];
         assert_eq!(dijkstra(&g, 0)[3], 4);
         assert_eq!(astar(&g, 0, 3, |_| 0), Some(4));
-        assert_eq!(topological_sort(&[vec![1], vec![2], vec![]]).unwrap(), vec![0, 1, 2]);
-        assert!(tarjan_scc(&[vec![1], vec![0], vec![]]).iter().any(|c| c.len() == 2));
-        assert_eq!(bfs(&[vec![1, 2], vec![3], vec![], vec![]], 0), vec![0, 1, 2, 3]);
-        assert_eq!(dfs(&[vec![1, 2], vec![3], vec![], vec![]], 0), vec![0, 1, 3, 2]);
-        assert_eq!(max_flow(vec![vec![0, 3, 2, 0], vec![0, 0, 1, 2], vec![0, 0, 0, 4], vec![0, 0, 0, 0]], 0, 3), 5);
+        assert_eq!(
+            topological_sort(&[vec![1], vec![2], vec![]]).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert!(tarjan_scc(&[vec![1], vec![0], vec![]])
+            .iter()
+            .any(|c| c.len() == 2));
+        assert_eq!(
+            bfs(&[vec![1, 2], vec![3], vec![], vec![]], 0),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            dfs(&[vec![1, 2], vec![3], vec![], vec![]], 0),
+            vec![0, 1, 3, 2]
+        );
+        assert_eq!(
+            max_flow(
+                vec![
+                    vec![0, 3, 2, 0],
+                    vec![0, 0, 1, 2],
+                    vec![0, 0, 0, 4],
+                    vec![0, 0, 0, 0]
+                ],
+                0,
+                3
+            ),
+            5
+        );
     }
 }

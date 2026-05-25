@@ -4,7 +4,10 @@ pub fn toy_hash(data: &[u8]) -> Hash {
     let mut h = [0u8; 32];
     for (i, &b) in data.iter().enumerate() {
         let j = i % 32;
-        h[j] = h[j].wrapping_mul(31).wrapping_add(b).rotate_left((i % 8) as u32);
+        h[j] = h[j]
+            .wrapping_mul(31)
+            .wrapping_add(b)
+            .rotate_left((i % 8) as u32);
     }
     h
 }
@@ -32,7 +35,12 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
     level[0]
 }
 
-pub fn verify_merkle_proof(leaf: Hash, mut index: usize, proof: &[(Hash, bool)], root: Hash) -> bool {
+pub fn verify_merkle_proof(
+    leaf: Hash,
+    mut index: usize,
+    proof: &[(Hash, bool)],
+    root: Hash,
+) -> bool {
     let mut acc = leaf;
     for &(sibling, sibling_is_left) in proof {
         acc = if sibling_is_left {
@@ -54,6 +62,11 @@ mod tests {
     fn verifies_merkle_path() {
         let leaves = [toy_hash(b"a"), toy_hash(b"b")];
         let root = merkle_root(&leaves);
-        assert!(verify_merkle_proof(leaves[0], 0, &[(leaves[1], false)], root));
+        assert!(verify_merkle_proof(
+            leaves[0],
+            0,
+            &[(leaves[1], false)],
+            root
+        ));
     }
 }

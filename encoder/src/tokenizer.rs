@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 // ── Special token IDs (must match EncoderConfig) ──────────────────────────────
-pub const PAD_ID:  u32 = 0;
-pub const CLS_ID:  u32 = 1;
-pub const SEP_ID:  u32 = 2;
-pub const UNK_ID:  u32 = 3;
+pub const PAD_ID: u32 = 0;
+pub const CLS_ID: u32 = 1;
+pub const SEP_ID: u32 = 2;
+pub const UNK_ID: u32 = 3;
 pub const FILE_ID: u32 = 4;
 const FIRST_NORMAL: u32 = 5;
 
@@ -17,7 +17,7 @@ const FIRST_NORMAL: u32 = 5;
 /// For production, replace with a proper BPE tokeniser (e.g. the `tokenizers`
 /// crate) pre-trained on Rust source.
 pub struct CodeTokenizer {
-    vocab:     HashMap<String, u32>,
+    vocab: HashMap<String, u32>,
     inv_vocab: Vec<String>,
 }
 
@@ -48,7 +48,11 @@ impl CodeTokenizer {
 
         let mut vocab: HashMap<String, u32> = HashMap::new();
         let mut inv_vocab: Vec<String> = vec![
-            "<PAD>".into(), "<CLS>".into(), "<SEP>".into(), "<UNK>".into(), "<FILE>".into(),
+            "<PAD>".into(),
+            "<CLS>".into(),
+            "<SEP>".into(),
+            "<UNK>".into(),
+            "<FILE>".into(),
         ];
 
         for (tok, _) in pairs.into_iter().take(max_vocab - FIRST_NORMAL as usize) {
@@ -72,8 +76,8 @@ impl CodeTokenizer {
     ///         [SEP] <op-history-tokens>
     pub fn encode_state(
         &self,
-        files: &[(&str, &str)],   // (path, content)
-        op_history: &[&str],       // JSON strings of applied ops
+        files: &[(&str, &str)], // (path, content)
+        op_history: &[&str],    // JSON strings of applied ops
         max_len: usize,
     ) -> Vec<u32> {
         let mut ids = vec![CLS_ID];
@@ -83,7 +87,9 @@ impl CodeTokenizer {
             ids.extend(self.encode(path));
             ids.push(SEP_ID);
             ids.extend(self.encode(content));
-            if ids.len() >= max_len { break; }
+            if ids.len() >= max_len {
+                break;
+            }
         }
 
         if !op_history.is_empty() {
@@ -122,6 +128,8 @@ fn tokenize_raw(text: &str) -> impl Iterator<Item = String> + '_ {
             }
         }
     }
-    if !buf.is_empty() { out.push(buf); }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
     out.into_iter()
 }

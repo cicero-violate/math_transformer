@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use crate::op::Op;
 use crate::policy::Policy;
+use crate::search::tree::{Edge, SearchTree};
 use crate::state::RepoState;
 use crate::value::Value;
-use crate::search::tree::{Edge, SearchTree};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -18,8 +18,12 @@ pub struct MctsConfig {
 
 impl Default for MctsConfig {
     fn default() -> Self {
-        Self { c_puct: 1.5, n_simulations: 50, max_depth: 8,
-               editor_bin: PathBuf::from("structural-editor") }
+        Self {
+            c_puct: 1.5,
+            n_simulations: 50,
+            max_depth: 8,
+            editor_bin: PathBuf::from("structural-editor"),
+        }
     }
 }
 
@@ -31,9 +35,9 @@ impl Default for MctsConfig {
 ///   policy — MCTS-improved visit-count distribution (the AlphaZero training target)
 ///   value  — mean backed-up value W(s)/N(s) across all simulations through this node
 pub struct NodeRecord {
-    pub state:  RepoState,
+    pub state: RepoState,
     pub policy: Vec<(Op, f32)>,
-    pub value:  f32,
+    pub value: f32,
 }
 
 // ── MCTS ──────────────────────────────────────────────────────────────────────
@@ -41,22 +45,30 @@ pub struct NodeRecord {
 pub struct Mcts<P, V> {
     pub config: MctsConfig,
     pub policy: P,
-    pub value:  V,
-    pub tree:   SearchTree,
+    pub value: V,
+    pub tree: SearchTree,
     /// Maps fingerprint → RepoState for every node visited during search.
     state_cache: HashMap<u64, RepoState>,
 }
 
 impl<P: Policy, V: Value> Mcts<P, V> {
     pub fn new(config: MctsConfig, policy: P, value: V) -> Self {
-        Self { config, policy, value, tree: SearchTree::new(), state_cache: HashMap::new() }
+        Self {
+            config,
+            policy,
+            value,
+            tree: SearchTree::new(),
+            state_cache: HashMap::new(),
+        }
     }
 
     /// Run `n_simulations` from `root`. Returns MCTS-improved action probabilities.
     pub fn run(&mut self, root: &RepoState) -> Vec<(Op, f32)> {
         let root_fp = root.fingerprint();
         self.tree.get_or_insert(root_fp);
-        self.state_cache.entry(root_fp).or_insert_with(|| root.clone());
+        self.state_cache
+            .entry(root_fp)
+            .or_insert_with(|| root.clone());
 
         for _ in 0..self.config.n_simulations {
             let mut path: Vec<(u64, usize)> = Vec::new();
@@ -99,15 +111,26 @@ impl<P: Policy, V: Value> Mcts<P, V> {
     /// Call after `run()`. Each record holds the MCTS-improved policy (visit
     /// counts normalised) and the mean backed-up value for that node.
     pub fn node_records(&self) -> Vec<NodeRecord> {
-        self.tree.all_expanded()
+        self.tree
+            .all_expanded()
             .filter_map(|(fp, node)| {
                 let state = self.state_cache.get(fp)?;
                 let total_w: f32 = node.edges.iter().map(|e| e.w).sum();
-                let value = if node.total_n > 0 { total_w / node.total_n as f32 } else { 0.0 };
-                let policy = node.edges.iter()
+                let value = if node.total_n > 0 {
+                    total_w / node.total_n as f32
+                } else {
+                    0.0
+                };
+                let policy = node
+                    .edges
+                    .iter()
                     .map(|e| (e.op.clone(), e.n as f32 / node.total_n.max(1) as f32))
                     .collect();
-                Some(NodeRecord { state: state.clone(), policy, value })
+                Some(NodeRecord {
+                    state: state.clone(),
+                    policy,
+                    value,
+                })
             })
             .collect()
     }
@@ -126,7 +149,9 @@ impl<P: Policy, V: Value> Mcts<P, V> {
         let is_expanded = self.tree.get(fp).map(|n| n.is_expanded).unwrap_or(false);
         let is_terminal = self.tree.get(fp).map(|n| n.is_terminal).unwrap_or(false);
 
-        if is_terminal { return self.value.score(state); }
+        if is_terminal {
+            return self.value.score(state);
+        }
 
         if !is_expanded {
             return self.expand_and_eval(state, fp);
@@ -143,7 +168,13 @@ impl<P: Policy, V: Value> Mcts<P, V> {
         let candidates = self.policy.propose(state);
         let edges: Vec<Edge> = candidates
             .into_iter()
-            .map(|c| Edge { op: c.op, child_fp: None, n: 0, w: 0.0, p: c.prior })
+            .map(|c| Edge {
+                op: c.op,
+                child_fp: None,
+                n: 0,
+                w: 0.0,
+                p: c.prior,
+            })
             .collect();
         let is_terminal = edges.is_empty();
         let node = self.tree.get_or_insert(fp);
@@ -171,6 +202,9 @@ impl<P: Policy, V: Value> Mcts<P, V> {
             None => return Vec::new(),
         };
         let total = node.total_n.max(1) as f32;
-        node.edges.iter().map(|e| (e.op.clone(), e.n as f32 / total)).collect()
+        node.edges
+            .iter()
+            .map(|e| (e.op.clone(), e.n as f32 / total))
+            .collect()
     }
 }

@@ -49,7 +49,10 @@ impl Value for VerifyValue {
                 }
                 s
             }
-            Err(e) => { eprintln!("[sandbox] {e:#}"); 0.0 }
+            Err(e) => {
+                eprintln!("[sandbox] {e:#}");
+                0.0
+            }
         }
     }
 }
@@ -73,7 +76,10 @@ impl VerifierCache {
                 }
             }
         }
-        Self { path, scores: Mutex::new(scores) }
+        Self {
+            path,
+            scores: Mutex::new(scores),
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<f32> {
@@ -149,6 +155,71 @@ fn workspace_content_fingerprint(state: &RepoState) -> u64 {
         }
     }
     h.finish()
+}
+
+// ── Judgement-delta value ─────────────────────────────────────────────────────
+
+/// Value function backed by the `judgement delta` reward signal.
+///
+/// Each evaluation applies the pending ops in a tempdir, re-runs
+/// `canon-rustc-v3` + `judgement`, computes `score_delta` against a baseline
+/// snapshot, and maps the reward to `[0, 1]` (0.5 = no change, >0.5 = improvement).
+///
+/// This is the primary value function for the full Canon reward loop.
+pub struct JudgementDeltaValue {
+    /// Path to the `structural-editor` binary.
+    pub editor_bin: PathBuf,
+    /// Pre-computed `judgement.jsonl` snapshot taken before any edits.
+    pub baseline_judgement: PathBuf,
+    /// Path to the `canon-rustc-v3` binary (used as `RUSTC_WRAPPER`).
+    pub canon_bin: PathBuf,
+    /// Path to the `judgement` binary.
+    pub judgement_bin: PathBuf,
+    /// Rustc crate target name (e.g. `"ai"`); determines the artifact subdir.
+    pub crate_name: String,
+    pub cache: Option<VerifierCache>,
+}
+
+impl Value for JudgementDeltaValue {
+    fn score(&self, state: &RepoState) -> f32 {
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            "jd".hash(&mut h);
+            workspace_content_fingerprint(state).hash(&mut h);
+            for op in &state.ops {
+                op.to_string().hash(&mut h);
+            }
+            format!("{:016x}", h.finish())
+        };
+
+        if let Some(cache) = &self.cache {
+            if let Some(score) = cache.get(&key) {
+                return score;
+            }
+        }
+
+        let result = sandbox::apply_and_score_delta(
+            state,
+            &self.editor_bin,
+            &self.baseline_judgement,
+            &self.canon_bin,
+            &self.judgement_bin,
+            &self.crate_name,
+        );
+
+        match result {
+            Ok(s) => {
+                if let Some(cache) = &self.cache {
+                    cache.insert(key, s);
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("[judgement-delta] {e:#}");
+                0.5 // neutral on scoring error (compiler failure already returns 0.0)
+            }
+        }
+    }
 }
 
 /// Constant value stub — every state scores 0.5 (useful for testing MCTS plumbing).

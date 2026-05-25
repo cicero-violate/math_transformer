@@ -30,18 +30,18 @@ pub struct EncoderConfig {
 impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
-            vocab_size:  8_192,
+            vocab_size: 8_192,
             max_seq_len: 2_048,
-            n_layers:    6,
-            d_model:     512,
-            n_heads:     8,
-            d_ff:        2_048,
-            dropout:     0.1,
-            n_ops:       64,
-            pad_id:  0,
-            cls_id:  1,
-            sep_id:  2,
-            unk_id:  3,
+            n_layers: 6,
+            d_model: 512,
+            n_heads: 8,
+            d_ff: 2_048,
+            dropout: 0.1,
+            n_ops: 64,
+            pad_id: 0,
+            cls_id: 1,
+            sep_id: 2,
+            unk_id: 3,
             file_id: 4,
         }
     }
@@ -55,12 +55,12 @@ impl EncoderConfig {
     pub fn small() -> Self {
         Self {
             max_seq_len: 512,
-            n_layers:    4,
-            d_model:     256,
-            n_heads:     4,
-            d_ff:        1_024,
-            dropout:     0.1,
-            n_ops:       16,
+            n_layers: 4,
+            d_model: 256,
+            n_heads: 4,
+            d_ff: 1_024,
+            dropout: 0.1,
+            n_ops: 16,
             ..Default::default()
         }
     }

@@ -9,7 +9,9 @@ pub struct PolicyHead {
 
 impl PolicyHead {
     pub fn new(d_model: usize, n_ops: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self { proj: linear(d_model, n_ops, vb.pp("proj"))? })
+        Ok(Self {
+            proj: linear(d_model, n_ops, vb.pp("proj"))?,
+        })
     }
 
     /// cls: (batch, d_model) → logits (batch, n_ops)
@@ -35,6 +37,6 @@ impl ValueHead {
     /// cls: (batch, d_model) → scalar (batch,)
     pub fn forward(&self, cls: &Tensor) -> Result<Tensor> {
         let h = self.fc1.forward(cls)?.relu()?;
-        candle_nn::ops::sigmoid(&self.fc2.forward(&h)?)?.squeeze(1)  // (batch,)
+        candle_nn::ops::sigmoid(&self.fc2.forward(&h)?)?.squeeze(1) // (batch,)
     }
 }

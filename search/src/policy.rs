@@ -16,32 +16,52 @@ pub trait Policy: Send + Sync {
 
 // ── Static template policies ──────────────────────────────────────────────────
 
-pub struct TemplatePolicy { pub templates: Vec<Op> }
+pub struct TemplatePolicy {
+    pub templates: Vec<Op>,
+}
 
 impl Policy for TemplatePolicy {
     fn propose(&self, _state: &RepoState) -> Vec<Candidate> {
         let n = self.templates.len();
         let prior = if n == 0 { 1.0 } else { 1.0 / n as f32 };
-        self.templates.iter().map(|op| Candidate { op: op.clone(), prior }).collect()
+        self.templates
+            .iter()
+            .map(|op| Candidate {
+                op: op.clone(),
+                prior,
+            })
+            .collect()
     }
 }
 
-pub struct NoisyTemplatePolicy { pub templates: Vec<Op>, pub alpha: f64 }
+pub struct NoisyTemplatePolicy {
+    pub templates: Vec<Op>,
+    pub alpha: f64,
+}
 
 impl Policy for NoisyTemplatePolicy {
     fn propose(&self, _state: &RepoState) -> Vec<Candidate> {
         use rand::distributions::Distribution;
         let n = self.templates.len();
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
         let rng = &mut rand::thread_rng();
         let gamma = rand::distributions::Uniform::new(0.0f64, 1.0);
         let mut noise: Vec<f64> = (0..n)
             .map(|_| (-gamma.sample(rng).ln()).powf(self.alpha))
             .collect();
         let sum: f64 = noise.iter().sum();
-        for x in &mut noise { *x /= sum; }
-        self.templates.iter().zip(noise)
-            .map(|(op, p)| Candidate { op: op.clone(), prior: p as f32 })
+        for x in &mut noise {
+            *x /= sum;
+        }
+        self.templates
+            .iter()
+            .zip(noise)
+            .map(|(op, p)| Candidate {
+                op: op.clone(),
+                prior: p as f32,
+            })
             .collect()
     }
 }
@@ -62,7 +82,9 @@ impl Policy for CandidateGen {
     fn propose(&self, state: &RepoState) -> Vec<Candidate> {
         let ops = scan_crate(&state.root, self.max_candidates);
         let n = ops.len();
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
         let prior = 1.0 / n as f32;
         ops.into_iter().map(|op| Candidate { op, prior }).collect()
     }
@@ -76,25 +98,42 @@ fn scan_crate(root: &Path, max: usize) -> Vec<Op> {
     for entry in walkdir::WalkDir::new(root).min_depth(1) {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy();
-        if name == "target" || name.starts_with('.') { continue; }
-        if !entry.file_type().is_file() { continue; }
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+        if name == "target" || name.starts_with('.') {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
 
-        let rel = entry.path()
-            .strip_prefix(root).unwrap_or(entry.path())
-            .to_string_lossy().replace('\\', "/");
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
 
-        let Ok(src) = std::fs::read_to_string(entry.path()) else { continue };
+        let Ok(src) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
 
         for item in scan_items(&src) {
             ops.extend(ops_for_item(&rel, &item));
-            if ops.len() >= max { ops.truncate(max); return ops; }
+            if ops.len() >= max {
+                ops.truncate(max);
+                return ops;
+            }
         }
     }
     ops
 }
 
-struct Item { kind: &'static str, name: String }
+struct Item {
+    kind: &'static str,
+    name: String,
+}
 
 /// Extract public items from Rust source using simple line-by-line scanning.
 fn scan_items(src: &str) -> Vec<Item> {
@@ -118,10 +157,13 @@ fn scan_items(src: &str) -> Vec<Item> {
         };
 
         // Extract the identifier — stop at whitespace, `(`, `<`, `{`, `:`
-        let name: String = rest.chars()
+        let name: String = rest
+            .chars()
             .take_while(|&c| c.is_alphanumeric() || c == '_')
             .collect();
-        if name.is_empty() || name == "for" { continue; }
+        if name.is_empty() || name == "for" {
+            continue;
+        }
 
         items.push(Item { kind, name });
     }

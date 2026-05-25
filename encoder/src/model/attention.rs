@@ -6,7 +6,7 @@ pub struct MultiHeadAttention {
     k: Linear,
     v: Linear,
     o: Linear,
-    n_heads:  usize,
+    n_heads: usize,
     head_dim: usize,
 }
 
@@ -28,9 +28,9 @@ impl MultiHeadAttention {
         let (b, s, _) = xs.dims3()?;
 
         let split = |proj: &Linear| -> Result<Tensor> {
-            let x = proj.forward(xs)?;                          // (b, s, d_model)
+            let x = proj.forward(xs)?; // (b, s, d_model)
             let x = x.reshape((b, s, self.n_heads, self.head_dim))?;
-            x.transpose(1, 2)?.contiguous()                     // (b, n_heads, s, head_dim)
+            x.transpose(1, 2)?.contiguous() // (b, n_heads, s, head_dim)
         };
 
         let q = split(&self.q)?;
@@ -38,13 +38,16 @@ impl MultiHeadAttention {
         let v = split(&self.v)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? // (b, h, s, s)
-                      .affine(scale, 0.0)?;
+        let scores = q
+            .matmul(&k.transpose(D::Minus1, D::Minus2)?)? // (b, h, s, s)
+            .affine(scale, 0.0)?;
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
-        let ctx = attn.matmul(&v)?                              // (b, h, s, head_dim)
-                      .transpose(1, 2)?.contiguous()?           // (b, s, h, head_dim)
-                      .reshape((b, s, self.n_heads * self.head_dim))?; // (b, s, d_model)
+        let ctx = attn
+            .matmul(&v)? // (b, h, s, head_dim)
+            .transpose(1, 2)?
+            .contiguous()? // (b, s, h, head_dim)
+            .reshape((b, s, self.n_heads * self.head_dim))?; // (b, s, d_model)
 
         self.o.forward(&ctx)
     }

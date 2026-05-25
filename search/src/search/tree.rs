@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::op::Op;
+use std::collections::HashMap;
 
 // ── Edge ──────────────────────────────────────────────────────────────────────
 
@@ -21,7 +21,11 @@ pub struct Edge {
 impl Edge {
     /// Mean value Q(s, a) = W / N.
     pub fn q(&self) -> f32 {
-        if self.n == 0 { 0.0 } else { self.w / self.n as f32 }
+        if self.n == 0 {
+            0.0
+        } else {
+            self.w / self.n as f32
+        }
     }
 
     /// PUCT score used for selection.
@@ -48,7 +52,12 @@ pub struct Node {
 
 impl Node {
     pub fn new() -> Self {
-        Self { edges: Vec::new(), total_n: 0, is_expanded: false, is_terminal: false }
+        Self {
+            edges: Vec::new(),
+            total_n: 0,
+            is_expanded: false,
+            is_terminal: false,
+        }
     }
 
     /// Index of the edge with the highest PUCT score.
@@ -84,7 +93,9 @@ pub struct SearchTree {
 
 impl SearchTree {
     pub fn new() -> Self {
-        Self { nodes: HashMap::new() }
+        Self {
+            nodes: HashMap::new(),
+        }
     }
 
     pub fn get(&self, fp: u64) -> Option<&Node> {
@@ -105,6 +116,8 @@ impl SearchTree {
 
     /// Iterate over all expanded (non-terminal) nodes.
     pub fn all_expanded(&self) -> impl Iterator<Item = (&u64, &Node)> {
-        self.nodes.iter().filter(|(_, n)| n.is_expanded && !n.is_terminal)
+        self.nodes
+            .iter()
+            .filter(|(_, n)| n.is_expanded && !n.is_terminal)
     }
 }

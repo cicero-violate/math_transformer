@@ -1,8 +1,8 @@
 use candle_core::{IndexOp, Module, Result, Tensor};
 use candle_nn::{embedding, layer_norm, Embedding, LayerNorm, VarBuilder};
 
-use crate::config::EncoderConfig;
 use super::layer::EncoderLayer;
+use crate::config::EncoderConfig;
 
 /// Transformer encoder backbone.
 ///
@@ -12,9 +12,9 @@ use super::layer::EncoderLayer;
 pub struct TransformerEncoder {
     tok_embed: Embedding,
     pos_embed: Embedding,
-    layers:    Vec<EncoderLayer>,
-    norm:      LayerNorm,
-    max_seq:   usize,
+    layers: Vec<EncoderLayer>,
+    norm: LayerNorm,
+    max_seq: usize,
 }
 
 impl TransformerEncoder {
@@ -44,11 +44,10 @@ impl TransformerEncoder {
 
         let token_ids = token_ids.i((.., ..seq))?;
         let positions = Tensor::arange(0u32, seq as u32, token_ids.device())?
-            .unsqueeze(0)?                               // (1, seq)
+            .unsqueeze(0)? // (1, seq)
             .broadcast_as(token_ids.shape())?;
 
-        let mut x = (self.tok_embed.forward(&token_ids)?
-                    + self.pos_embed.forward(&positions)?)?;
+        let mut x = (self.tok_embed.forward(&token_ids)? + self.pos_embed.forward(&positions)?)?;
 
         for layer in &self.layers {
             x = layer.forward(&x)?;

@@ -11,10 +11,10 @@ use crate::tokenizer::CodeTokenizer;
 /// `search` crate's `Policy` and `Value` traits (kept as plain methods here to
 /// avoid a hard dependency on that crate).
 pub struct EncoderInfer {
-    model:     EncoderModel,
+    model: EncoderModel,
     tokenizer: CodeTokenizer,
-    cfg:       EncoderConfig,
-    device:    Device,
+    cfg: EncoderConfig,
+    device: Device,
 }
 
 impl EncoderInfer {
@@ -35,13 +35,17 @@ impl EncoderInfer {
         cfg: EncoderConfig,
         device: Device,
     ) -> Result<Self> {
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)?
-        };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)? };
         let model = EncoderModel::new(&cfg, vb)?;
         let vocab_json = std::fs::read_to_string(vocab_path)?;
         let tokenizer = CodeTokenizer::from_json(&vocab_json)?;
-        Ok(Self { model, tokenizer, cfg, device })
+        Ok(Self {
+            model,
+            tokenizer,
+            cfg,
+            device,
+        })
     }
 
     /// Given the current repo state (list of (path, content) pairs and the
@@ -53,7 +57,9 @@ impl EncoderInfer {
         op_history: &[&str],
         templates: &[Op],
     ) -> Result<(Vec<f32>, f32)> {
-        let ids = self.tokenizer.encode_state(files, op_history, self.cfg.max_seq_len);
+        let ids = self
+            .tokenizer
+            .encode_state(files, op_history, self.cfg.max_seq_len);
         let tok_t = Tensor::from_vec(ids, (1, self.cfg.max_seq_len), &self.device)?;
 
         let (policy_probs, value_t) = self.model.forward(&tok_t)?;

@@ -18,7 +18,11 @@ pub struct EGraph {
 
 impl EGraph {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), classes: DisjointSet::new(0), memo: HashMap::new() }
+        Self {
+            nodes: Vec::new(),
+            classes: DisjointSet::new(0),
+            memo: HashMap::new(),
+        }
     }
 
     pub fn add(&mut self, expr: Expr) -> usize {

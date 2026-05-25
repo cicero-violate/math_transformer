@@ -34,22 +34,41 @@ pub struct Interval {
 
 impl Interval {
     pub fn join(self, rhs: Self) -> Self {
-        Self { lo: self.lo.min(rhs.lo), hi: self.hi.max(rhs.hi) }
+        Self {
+            lo: self.lo.min(rhs.lo),
+            hi: self.hi.max(rhs.hi),
+        }
     }
 
     pub fn add(self, rhs: Self) -> Self {
-        Self { lo: self.lo + rhs.lo, hi: self.hi + rhs.hi }
+        Self {
+            lo: self.lo + rhs.lo,
+            hi: self.hi + rhs.hi,
+        }
     }
 
     pub fn widen(self, rhs: Self) -> Self {
         Self {
-            lo: if rhs.lo < self.lo { i64::MIN / 4 } else { self.lo },
-            hi: if rhs.hi > self.hi { i64::MAX / 4 } else { self.hi },
+            lo: if rhs.lo < self.lo {
+                i64::MIN / 4
+            } else {
+                self.lo
+            },
+            hi: if rhs.hi > self.hi {
+                i64::MAX / 4
+            } else {
+                self.hi
+            },
         }
     }
 }
 
-pub fn abstract_interpret_add(env: &HashMap<String, Interval>, dst: &str, a: &str, b: &str) -> HashMap<String, Interval> {
+pub fn abstract_interpret_add(
+    env: &HashMap<String, Interval>,
+    dst: &str,
+    a: &str,
+    b: &str,
+) -> HashMap<String, Interval> {
     let mut next = env.clone();
     if let (Some(x), Some(y)) = (env.get(a), env.get(b)) {
         next.insert(dst.to_string(), x.add(*y));
@@ -96,19 +115,37 @@ where
 pub fn reachable_pairs(edges: &[(String, String)]) -> BTreeSet<Fact> {
     let mut facts = BTreeSet::new();
     for (a, b) in edges {
-        facts.insert(Fact { pred: "edge".into(), args: vec![a.clone(), b.clone()] });
-        facts.insert(Fact { pred: "path".into(), args: vec![a.clone(), b.clone()] });
+        facts.insert(Fact {
+            pred: "edge".into(),
+            args: vec![a.clone(), b.clone()],
+        });
+        facts.insert(Fact {
+            pred: "path".into(),
+            args: vec![a.clone(), b.clone()],
+        });
     }
-    let nodes: HashSet<String> = edges.iter().flat_map(|(a, b)| [a.clone(), b.clone()]).collect();
+    let nodes: HashSet<String> = edges
+        .iter()
+        .flat_map(|(a, b)| [a.clone(), b.clone()])
+        .collect();
     let mut rules = Vec::new();
     for a in &nodes {
         for b in &nodes {
             for c in &nodes {
                 rules.push(Rule {
-                    head: Fact { pred: "path".into(), args: vec![a.clone(), c.clone()] },
+                    head: Fact {
+                        pred: "path".into(),
+                        args: vec![a.clone(), c.clone()],
+                    },
                     body: vec![
-                        Fact { pred: "path".into(), args: vec![a.clone(), b.clone()] },
-                        Fact { pred: "path".into(), args: vec![b.clone(), c.clone()] },
+                        Fact {
+                            pred: "path".into(),
+                            args: vec![a.clone(), b.clone()],
+                        },
+                        Fact {
+                            pred: "path".into(),
+                            args: vec![b.clone(), c.clone()],
+                        },
                     ],
                 });
             }
@@ -124,12 +161,28 @@ mod tests {
     #[test]
     fn logic_tools_work() {
         let paths = reachable_pairs(&[("a".into(), "b".into()), ("b".into(), "c".into())]);
-        assert!(paths.contains(&Fact { pred: "path".into(), args: vec!["a".into(), "c".into()] }));
+        assert!(paths.contains(&Fact {
+            pred: "path".into(),
+            args: vec!["a".into(), "c".into()]
+        }));
         let mut env = HashMap::new();
         env.insert("x".into(), Interval { lo: 1, hi: 2 });
         env.insert("y".into(), Interval { lo: 3, hi: 5 });
-        assert_eq!(abstract_interpret_add(&env, "z", "x", "y")["z"], Interval { lo: 4, hi: 7 });
-        let found = cegis(|bad| bad.len(), |n| if *n >= 2 { Ok(()) } else { Err("too small".into()) }, 4);
+        assert_eq!(
+            abstract_interpret_add(&env, "z", "x", "y")["z"],
+            Interval { lo: 4, hi: 7 }
+        );
+        let found = cegis(
+            |bad| bad.len(),
+            |n| {
+                if *n >= 2 {
+                    Ok(())
+                } else {
+                    Err("too small".into())
+                }
+            },
+            4,
+        );
         assert_eq!(found, Some(2));
         assert!(property_fuzz(32, |x| x == x).is_none());
     }

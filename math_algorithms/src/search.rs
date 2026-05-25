@@ -1,6 +1,12 @@
 use std::cmp::Ordering;
 
-pub fn beam_search<S, Expand, Score>(start: S, width: usize, steps: usize, expand: Expand, score: Score) -> Vec<S>
+pub fn beam_search<S, Expand, Score>(
+    start: S,
+    width: usize,
+    steps: usize,
+    expand: Expand,
+    score: Score,
+) -> Vec<S>
 where
     S: Clone,
     Expand: Fn(&S) -> Vec<S>,
