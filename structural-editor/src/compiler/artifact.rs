@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::text::store_text;
 use crate::op::{Receipt, Rollback};
 
 pub fn apply_receipt(
@@ -14,7 +15,7 @@ pub fn apply_receipt(
         "{{\"kind\":\"receipt\",\"summary\":{:?},\"rollback_required\":{}}}\n",
         op.summary, op.rollback_required
     );
-    buffers.insert(abs, Some(content.into_bytes()));
+    store_text(abs, content, buffers);
     Ok(())
 }
 

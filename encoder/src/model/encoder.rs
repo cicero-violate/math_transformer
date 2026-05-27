@@ -57,6 +57,6 @@ impl TransformerEncoder {
 
     /// Returns the [CLS] embedding (batch, d_model).
     pub fn cls(&self, token_ids: &Tensor) -> Result<Tensor> {
-        self.forward(token_ids)?.i((.., 0, ..))
+        self.forward(token_ids)?.i((.., 0, ..))?.contiguous()
     }
 }

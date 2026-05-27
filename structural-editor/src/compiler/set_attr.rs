@@ -1,8 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::text::{
+    insert_line_before, line_start_with_indent, load_path_text, selector_item, store_text,
+};
 use crate::op::{AttrKey, NodeLocator, SetAttr};
 
 pub fn apply(
@@ -11,18 +13,16 @@ pub fn apply(
     buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<()> {
     let path = op.at.path();
-    let abs = root.join(path);
-    let mut content = load_buf(&abs, buffers)?;
-    let text = String::from_utf8_lossy(&content).into_owned();
+    let (abs, text) = load_path_text(root, path, buffers)?;
 
     let item_start = match &op.at {
         NodeLocator::Anchor { byte_from, .. } => *byte_from,
         NodeLocator::Selector { selector, .. } => {
-            let item = selector.split("::").last().unwrap_or(selector);
+            let item = selector_item(selector);
             let item_start = text
                 .find(item)
                 .ok_or_else(|| anyhow::anyhow!("selector {:?} not found in {path}", selector))?;
-            item_line_start(&text, item_start)
+            line_start_with_indent(&text, item_start)
         }
     };
 
@@ -60,18 +60,8 @@ pub fn apply(
         AttrKey::Custom => insert_attr(&text, item_start, &op.value),
     };
 
-    content = updated.into_bytes();
-    buffers.insert(abs, Some(content));
+    store_text(abs, updated, buffers);
     Ok(())
-}
-
-fn item_line_start(text: &str, item_start: usize) -> usize {
-    let line_start = text[..item_start]
-        .rfind('\n')
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    let line = &text[line_start..item_start];
-    line_start + line.len() - line.trim_start().len()
 }
 
 fn set_visibility(text: &str, item_start: usize, vis: &str) -> String {
@@ -120,28 +110,9 @@ fn set_derive(text: &str, item_start: usize, derives: &str) -> String {
 }
 
 fn set_doc(text: &str, item_start: usize, doc: &str) -> String {
-    let before = &text[..item_start];
-    let after = &text[item_start..];
-    let doc_line = format!("/// {doc}\n");
-    format!("{before}{doc_line}{after}")
+    insert_line_before(text, item_start, &format!("/// {doc}"))
 }
 
 fn insert_attr(text: &str, item_start: usize, attr: &str) -> String {
-    let before = &text[..item_start];
-    let after = &text[item_start..];
-    format!("{before}{attr}\n{after}")
-}
-
-fn load_buf(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<Vec<u8>> {
-    if let Some(entry) = buffers.get(abs) {
-        return match entry {
-            Some(v) => Ok(v.clone()),
-            None => bail!("file {} was deleted earlier in this batch", abs.display()),
-        };
-    }
-    if abs.exists() {
-        Ok(fs::read(abs)?)
-    } else {
-        Ok(Vec::new())
-    }
+    insert_line_before(text, item_start, attr)
 }

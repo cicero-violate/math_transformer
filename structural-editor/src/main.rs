@@ -14,25 +14,50 @@ fn main() -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
+    run(stdin.lock(), &mut out)
+}
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
+fn run<R, W>(input: R, out: &mut W) -> Result<()>
+where
+    R: BufRead,
+    W: Write,
+{
+    for line in input.lines() {
+        process_line(&line?, out)?;
+    }
+    Ok(())
+}
 
-        let response = match parse_and_run(trimmed) {
-            Ok(r) => r,
-            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-        };
-
-        serde_json::to_writer(&mut out, &response)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+fn process_line<W: Write>(line: &str, out: &mut W) -> Result<()> {
+    let trimmed = line.trim();
+    if should_skip(trimmed) {
+        return Ok(());
     }
 
+    let response = response_for(trimmed);
+    write_response(out, &response)
+}
+
+fn should_skip(line: &str) -> bool {
+    line.is_empty() || line.starts_with("//")
+}
+
+fn response_for(line: &str) -> serde_json::Value {
+    match parse_and_run(line) {
+        Ok(response) => response,
+        Err(error) => error_response(error),
+    }
+}
+
+fn write_response<W: Write>(out: &mut W, response: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(&mut *out, response)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
+}
+
+fn error_response(error: impl ToString) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": error.to_string() })
 }
 
 fn parse_and_run(line: &str) -> Result<serde_json::Value> {

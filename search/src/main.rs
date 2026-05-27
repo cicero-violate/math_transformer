@@ -280,14 +280,12 @@ fn main() -> Result<()> {
             }
         }
         "judgement-delta" => {
-            let baseline = cli
-                .baseline_judgement
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--baseline-judgement required with --value judgement-delta"))?;
-            let crate_name = cli
-                .crate_name
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--crate-name required with --value judgement-delta"))?;
+            let baseline = cli.baseline_judgement.clone().ok_or_else(|| {
+                anyhow::anyhow!("--baseline-judgement required with --value judgement-delta")
+            })?;
+            let crate_name = cli.crate_name.clone().ok_or_else(|| {
+                anyhow::anyhow!("--crate-name required with --value judgement-delta")
+            })?;
             let v = judgement_delta_value(
                 cli.editor_bin.clone(),
                 baseline,
@@ -298,13 +296,27 @@ fn main() -> Result<()> {
             );
             if let Some(infer) = encoder.clone() {
                 run_with!(
-                    EncPolicy::new(infer, policy_source(policy_is_dynamic, max_cands, templates)),
+                    EncPolicy::new(
+                        infer,
+                        policy_source(policy_is_dynamic, max_cands, templates)
+                    ),
                     v
                 );
             } else if policy_is_dynamic {
-                run_with!(CandidateGen { max_candidates: max_cands }, v);
+                run_with!(
+                    CandidateGen {
+                        max_candidates: max_cands
+                    },
+                    v
+                );
             } else {
-                run_with!(NoisyTemplatePolicy { templates, alpha: 0.3 }, v);
+                run_with!(
+                    NoisyTemplatePolicy {
+                        templates,
+                        alpha: 0.3
+                    },
+                    v
+                );
             }
         }
         "encoder" => {

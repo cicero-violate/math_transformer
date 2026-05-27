@@ -66,7 +66,7 @@ pub fn apply_and_score_delta(
         .arg(tmp.path().join("Cargo.toml"))
         .env("RUSTC_WRAPPER", canon_bin)
         .env("CANON_RUSTC_V3_ARTIFACT_DIR", &artifact_dir)
-        .env("CANON_RUSTC_V3_SKIP_CST", "1")  // judgement only needs semantic_index
+        .env("CANON_RUSTC_V3_SKIP_CST", "1") // judgement only needs semantic_index
         .env("CARGO_TARGET_DIR", &sandbox_target)
         .stdout(Stdio::null());
     if let Some(p) = pkg.as_deref() {
@@ -82,7 +82,11 @@ pub fn apply_and_score_delta(
 
     // Diagnose empty artifact dir before attempting judgement.
     let artifact_entries: Vec<_> = std::fs::read_dir(&artifact_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
         .unwrap_or_default();
     if artifact_entries.is_empty() {
         bail!(
@@ -93,7 +97,8 @@ pub fn apply_and_score_delta(
     if !crate_artifact_dir.exists() {
         bail!(
             "artifact subdir for crate '{}' not found; got: {:?}",
-            crate_name, artifact_entries
+            crate_name,
+            artifact_entries
         );
     }
 
@@ -117,7 +122,10 @@ pub fn apply_and_score_delta(
 
     let new_judgement = judgement_out.join("judgement.jsonl");
     if !new_judgement.exists() {
-        bail!("judgement produced no output at {}", new_judgement.display());
+        bail!(
+            "judgement produced no output at {}",
+            new_judgement.display()
+        );
     }
 
     // Compute reward via `judgement delta`.

@@ -1,8 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::text::{filter_lines_to_string, load_path_text, store_path_text};
 use crate::op::{AddEdge, EdgeKind, RemoveEdge};
 
 pub fn add(
@@ -10,9 +10,7 @@ pub fn add(
     root: &Path,
     buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<()> {
-    let abs = root.join(&op.file);
-    let mut content = load_buf(&abs, buffers)?;
-    let text = String::from_utf8_lossy(&content).into_owned();
+    let (_abs, text) = load_path_text(root, &op.file, buffers)?;
 
     let line = edge_to_text(&op.edge);
 
@@ -37,8 +35,7 @@ pub fn add(
         }
     };
 
-    content = updated.into_bytes();
-    buffers.insert(abs, Some(content));
+    store_path_text(root, &op.file, updated, buffers);
     Ok(())
 }
 
@@ -47,9 +44,7 @@ pub fn remove(
     root: &Path,
     buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<()> {
-    let abs = root.join(&op.file);
-    let mut content = load_buf(&abs, buffers)?;
-    let text = String::from_utf8_lossy(&content).into_owned();
+    let (_abs, text) = load_path_text(root, &op.file, buffers)?;
 
     let line = edge_to_text(&op.edge);
     let updated = match &op.edge {
@@ -67,8 +62,7 @@ pub fn remove(
         }
     };
 
-    content = updated.into_bytes();
-    buffers.insert(abs, Some(content));
+    store_path_text(root, &op.file, updated, buffers);
     Ok(())
 }
 
@@ -139,22 +133,5 @@ fn insert_where_bound(text: &str, param: &str, bound: &str) -> String {
 
 fn remove_where_bound(text: &str, param: &str, bound: &str) -> String {
     let clause = format!("{param}: {bound}");
-    text.lines()
-        .filter(|l| !l.contains(&clause))
-        .map(|l| format!("{l}\n"))
-        .collect()
-}
-
-fn load_buf(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<Vec<u8>> {
-    if let Some(entry) = buffers.get(abs) {
-        return match entry {
-            Some(v) => Ok(v.clone()),
-            None => bail!("file {} was deleted earlier in this batch", abs.display()),
-        };
-    }
-    if abs.exists() {
-        Ok(fs::read(abs)?)
-    } else {
-        Ok(Vec::new())
-    }
+    filter_lines_to_string(text, |line| !line.contains(&clause))
 }

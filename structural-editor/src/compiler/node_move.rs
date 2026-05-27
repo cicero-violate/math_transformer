@@ -1,8 +1,11 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::text::{
+    append_bytes, checked_range, cut_bytes, delete_path, insert_bytes, item_range, load_path_bytes,
+    load_path_text, store_bytes, store_text,
+};
 use crate::op::{MoveNode, NodeKind, NodeLocator};
 
 pub fn apply(
@@ -22,20 +25,17 @@ fn move_file(
     root: &Path,
     buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<()> {
-    let src_abs = root.join(op.from.path());
-    let dst_abs = root.join(op.to.path());
-
-    let content = load_buf(&src_abs, buffers)?;
-    buffers.insert(dst_abs, Some(content));
+    let (src_abs, content) = load_path_bytes(root, op.from.path(), buffers)?;
+    store_bytes(root.join(op.to.path()), content, buffers);
 
     if op.preserve_facade {
         let facade = op
             .facade_text
             .clone()
             .unwrap_or_else(|| default_facade(op.to.path()));
-        buffers.insert(src_abs, Some(facade.into_bytes()));
+        store_text(src_abs, facade, buffers);
     } else {
-        buffers.insert(src_abs, None);
+        delete_path(root, op.from.path(), buffers);
     }
     Ok(())
 }
@@ -45,71 +45,47 @@ fn move_item(
     root: &Path,
     buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<()> {
-    // Cut item text from source.
-    let item_text = match &op.from {
+    let item_text = cut_item_text(op, root, buffers)?;
+    paste_item_text(op, root, buffers, item_text)
+}
+
+fn cut_item_text(
+    op: &MoveNode,
+    root: &Path,
+    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    match &op.from {
         NodeLocator::Anchor {
             path,
             byte_from,
             byte_to,
         } => {
-            let abs = root.join(path);
-            let mut content = load_buf(&abs, buffers)?;
-            let from = (*byte_from).min(content.len());
-            let to = (*byte_to).min(content.len());
-            if from > to {
-                bail!("move source anchor [{from},{to}) invalid in {path}");
-            }
-            let item: Vec<u8> = content[from..to].to_vec();
-            content.drain(from..to);
-            buffers.insert(abs, Some(content));
-            item
+            let (abs, content) = load_path_bytes(root, path, buffers)?;
+            let (from, to) =
+                checked_range(path, *byte_from, *byte_to, content.len(), "move source")?;
+            cut_bytes(abs, buffers, from..to)
         }
         NodeLocator::Selector { path, selector } => {
-            let abs = root.join(path);
-            let mut content = load_buf(&abs, buffers)?;
-            let text = String::from_utf8_lossy(&content).into_owned();
-            let (from, to) = find_item_range(&text, selector)
+            let (abs, text) = load_path_text(root, path, buffers)?;
+            let (from, to) = item_range(&text, selector)
                 .ok_or_else(|| anyhow::anyhow!("selector {:?} not found in {path}", selector))?;
-            let item = content[from..to].to_vec();
-            content.drain(from..to);
-            buffers.insert(abs, Some(content));
-            item
+            cut_bytes(abs, buffers, from..to)
         }
-    };
+    }
+}
 
-    // Paste item text at destination.
+fn paste_item_text(
+    op: &MoveNode,
+    root: &Path,
+    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
+    item_text: Vec<u8>,
+) -> Result<()> {
     match &op.to {
         NodeLocator::Anchor {
             path, byte_from, ..
-        } => {
-            let abs = root.join(path);
-            let mut content = load_buf(&abs, buffers)?;
-            let at = (*byte_from).min(content.len());
-            content.splice(at..at, item_text);
-            buffers.insert(abs, Some(content));
-        }
-        NodeLocator::Selector { path, .. } => {
-            // Append to destination file if no precise position.
-            let abs = root.join(path);
-            let mut content = load_buf(&abs, buffers)?;
-            content.extend_from_slice(&item_text);
-            buffers.insert(abs, Some(content));
-        }
+        } => insert_bytes(root.join(path), buffers, *byte_from, item_text),
+        NodeLocator::Selector { path, .. } => append_bytes(root.join(path), buffers, &item_text),
     }
-    Ok(())
-}
-
-fn find_item_range(text: &str, selector: &str) -> Option<(usize, usize)> {
-    let item = selector.split("::").last()?;
-    let start = text.find(item)?;
-    let rest = &text[start..];
-    let end = rest
-        .find("\npub ")
-        .or_else(|| rest.find("\nfn "))
-        .or_else(|| rest.find("\nstruct "))
-        .or_else(|| rest.find("\nimpl "))
-        .unwrap_or(rest.len());
-    Some((start, start + end))
 }
 
 fn default_facade(to_path: &str) -> String {
@@ -118,18 +94,4 @@ fn default_facade(to_path: &str) -> String {
         .trim_end_matches(".rs")
         .replace('/', "::");
     format!("pub use crate::{module}::*;\n")
-}
-
-fn load_buf(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<Vec<u8>> {
-    if let Some(entry) = buffers.get(abs) {
-        return match entry {
-            Some(v) => Ok(v.clone()),
-            None => bail!("file {} was deleted earlier in this batch", abs.display()),
-        };
-    }
-    if abs.exists() {
-        Ok(fs::read(abs)?)
-    } else {
-        Ok(Vec::new())
-    }
 }

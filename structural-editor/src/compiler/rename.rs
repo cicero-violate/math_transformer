@@ -1,8 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::text::{load_path_text, store_text};
 use crate::op::RenameSymbol;
 
 pub fn apply(
@@ -19,13 +19,11 @@ pub fn apply(
     }
 
     for file in files {
-        let abs = root.join(&file);
-        let content = load_buf(&abs, buffers)?;
-        let text = String::from_utf8_lossy(&content).into_owned();
+        let (abs, text) = load_path_text(root, &file, buffers)?;
         // Replace all whole-word occurrences of old_name with new_name.
         let updated = replace_word(&text, &op.old_name, &op.new_name);
         if updated != text {
-            buffers.insert(abs, Some(updated.into_bytes()));
+            store_text(abs, updated, buffers);
         }
     }
 
@@ -63,18 +61,4 @@ fn replace_word(text: &str, old: &str, new: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn load_buf(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<Vec<u8>> {
-    if let Some(entry) = buffers.get(abs) {
-        return match entry {
-            Some(v) => Ok(v.clone()),
-            None => bail!("file {} was deleted earlier in this batch", abs.display()),
-        };
-    }
-    if abs.exists() {
-        Ok(fs::read(abs)?)
-    } else {
-        Ok(Vec::new())
-    }
 }

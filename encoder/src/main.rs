@@ -41,7 +41,7 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
         /// Max sequence length (tokens); must match training config.
-        #[arg(long, default_value_t = 2048)]
+        #[arg(long, default_value_t = 512)]
         max_len: usize,
         /// Token ID used for padding.
         #[arg(long, default_value_t = 0)]
@@ -56,7 +56,7 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 1e-4)]
         lr: f64,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 8)]
         batch_size: usize,
         #[arg(long, default_value_t = 10)]
         epochs: usize,
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
             out,
             vocab_size,
         } => {
-            let corpus = collect_corpus(&src_dir)?;
+            let corpus = collect_corpus(src_dir.as_path())?;
             let tok = CodeTokenizer::build_vocab(&corpus, vocab_size);
             std::fs::write(&out, tok.to_json())?;
             eprintln!(
@@ -136,8 +136,8 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("line {}: missing policy", lineno + 1))?;
                 let value_target = rec["value"]
                     .as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("line {}: missing value", lineno + 1))?
-                    as f32;
+                    .map(|v| v as f32)
+                    .ok_or_else(|| anyhow::anyhow!("line {}: missing value", lineno + 1))?;
 
                 let policy_target: Vec<f32> = policy_raw
                     .iter()
@@ -191,7 +191,7 @@ fn main() -> Result<()> {
             device,
             resume,
         } => {
-            let examples = load_jsonl(&data)?;
+            let examples = load_jsonl(data.as_path())?;
             eprintln!("Loaded {} training examples", examples.len());
 
             let mut cfg = if small {

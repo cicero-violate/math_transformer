@@ -1,15 +1,13 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::text::{filter_lines_to_string, load_text, store_text};
 use crate::op::CargoChange;
 
-pub fn apply(
-    op: &CargoChange,
-    root: &Path,
-    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
-) -> Result<()> {
+type Buffers = HashMap<PathBuf, Option<Vec<u8>>>;
+
+pub fn apply(op: &CargoChange, root: &Path, buffers: &mut Buffers) -> Result<()> {
     match op {
         CargoChange::AddDependency {
             manifest,
@@ -28,7 +26,7 @@ pub fn apply(
             )?;
         }
         CargoChange::RemoveDependency { manifest, name } => {
-            remove_dep(root, buffers, manifest, "[dependencies]", name)?;
+            remove_dep(root, buffers, manifest, name)?;
         }
         CargoChange::AddDevDependency {
             manifest,
@@ -47,7 +45,7 @@ pub fn apply(
             )?;
         }
         CargoChange::RemoveDevDependency { manifest, name } => {
-            remove_dep(root, buffers, manifest, "[dev-dependencies]", name)?;
+            remove_dep(root, buffers, manifest, name)?;
         }
         CargoChange::AddBuildDependency {
             manifest,
@@ -70,60 +68,24 @@ pub fn apply(
             name,
             members,
         } => {
-            let abs = root.join(manifest);
-            let mut text = load_text(&abs, buffers)?;
-            let entry = if members.is_empty() {
-                format!("{name} = []\n")
-            } else {
-                let list = members
-                    .iter()
-                    .map(|m| format!("\"{m}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{name} = [{list}]\n")
-            };
-            if let Some(pos) = find_section(&text, "[features]") {
-                let insert = pos + "[features]".len() + 1;
-                text.insert_str(insert, &entry);
-            } else {
-                text.push_str(&format!("\n[features]\n{entry}"));
-            }
-            buffers.insert(abs, Some(text.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| {
+                let entry = feature_entry(name, members);
+                insert_under_section_or_append(text, "[features]", &entry);
+            })?;
         }
         CargoChange::RemoveFeature { manifest, name } => {
-            let abs = root.join(manifest);
-            let text = load_text(&abs, buffers)?;
-            let updated = remove_key_line(&text, name);
-            buffers.insert(abs, Some(updated.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| {
+                *text = remove_key_line(text, name);
+            })?;
         }
         CargoChange::SetPackageField {
             manifest,
             field,
             value,
         } => {
-            let abs = root.join(manifest);
-            let text = load_text(&abs, buffers)?;
-            let key_eq = format!("{field} =");
-            let updated = if let Some(line_start) = find_key_line(&text, &key_eq) {
-                let line_end = text[line_start..]
-                    .find('\n')
-                    .map(|i| line_start + i + 1)
-                    .unwrap_or(text.len());
-                let mut t = text.clone();
-                t.replace_range(line_start..line_end, &format!("{field} = \"{value}\"\n"));
-                t
-            } else {
-                // Append under [package].
-                if let Some(pos) = find_section(&text, "[package]") {
-                    let insert = pos + "[package]".len() + 1;
-                    let mut t = text.clone();
-                    t.insert_str(insert, &format!("{field} = \"{value}\"\n"));
-                    t
-                } else {
-                    format!("{text}\n{field} = \"{value}\"\n")
-                }
-            };
-            buffers.insert(abs, Some(updated.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| {
+                set_package_field(text, field, value);
+            })?;
         }
         CargoChange::AddBinTarget {
             manifest,
@@ -137,14 +99,16 @@ pub fn apply(
             path,
             crate_type,
         } => {
-            let abs = root.join(manifest);
-            let mut text = load_text(&abs, buffers)?;
-            let crate_type_line = crate_type
-                .as_deref()
-                .map(|t| format!("crate-type = [\"{t}\"]\n"))
-                .unwrap_or_default();
-            text.push_str(&format!("\n[lib]\npath = \"{path}\"\n{crate_type_line}"));
-            buffers.insert(abs, Some(text.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| {
+                let crate_type_line = crate_type
+                    .as_deref()
+                    .map(|t| format!("crate-type = [\"{t}\"]\n"))
+                    .unwrap_or_default();
+                append_lines(
+                    text,
+                    &format!("[lib]\npath = \"{path}\"\n{crate_type_line}"),
+                );
+            })?;
         }
         CargoChange::AddTestTarget {
             manifest,
@@ -165,18 +129,12 @@ pub fn apply(
             kind,
             name,
         } => {
-            let abs = root.join(manifest);
-            let text = load_text(&abs, buffers)?;
-            let updated = remove_target_block(&text, kind, name);
-            buffers.insert(abs, Some(updated.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| {
+                *text = remove_target_block(text, kind, name);
+            })?;
         }
         CargoChange::InsertSnippet { manifest, snippet } => {
-            let abs = root.join(manifest);
-            let mut text = load_text(&abs, buffers)?;
-            text.push('\n');
-            text.push_str(snippet);
-            text.push('\n');
-            buffers.insert(abs, Some(text.into_bytes()));
+            update_manifest(root, buffers, manifest, |text| append_lines(text, snippet))?;
         }
     }
 
@@ -185,66 +143,120 @@ pub fn apply(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+fn update_manifest<F>(root: &Path, buffers: &mut Buffers, manifest: &str, edit: F) -> Result<()>
+where
+    F: FnOnce(&mut String),
+{
+    let abs = root.join(manifest);
+    let mut text = load_text(&abs, buffers)?;
+    edit(&mut text);
+    store_text(abs, text, buffers);
+    Ok(())
+}
+
 fn append_dep(
     root: &Path,
-    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
+    buffers: &mut Buffers,
     manifest: &str,
     section: &str,
     name: &str,
     version: &str,
     features: &[String],
 ) -> Result<()> {
-    let abs = root.join(manifest);
-    let mut text = load_text(&abs, buffers)?;
-    let entry = if features.is_empty() {
-        format!("{name} = \"{version}\"\n")
-    } else {
-        let feats = features
-            .iter()
-            .map(|f| format!("\"{f}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{name} = {{ version = \"{version}\", features = [{feats}] }}\n")
-    };
-    if let Some(pos) = find_section(&text, section) {
-        let insert = pos + section.len() + 1;
-        text.insert_str(insert, &entry);
-    } else {
-        text.push_str(&format!("\n{section}\n{entry}"));
-    }
-    buffers.insert(abs, Some(text.into_bytes()));
-    Ok(())
+    update_manifest(root, buffers, manifest, |text| {
+        let entry = dependency_entry(name, version, features);
+        insert_under_section_or_append(text, section, &entry);
+    })
 }
 
-fn remove_dep(
-    root: &Path,
-    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
-    manifest: &str,
-    _section: &str,
-    name: &str,
-) -> Result<()> {
-    let abs = root.join(manifest);
-    let text = load_text(&abs, buffers)?;
-    let updated = remove_key_line(&text, name);
-    buffers.insert(abs, Some(updated.into_bytes()));
-    Ok(())
+fn remove_dep(root: &Path, buffers: &mut Buffers, manifest: &str, name: &str) -> Result<()> {
+    update_manifest(root, buffers, manifest, |text| {
+        *text = remove_key_line(text, name);
+    })
 }
 
 fn append_target(
     root: &Path,
-    buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>,
+    buffers: &mut Buffers,
     manifest: &str,
     kind: &str,
     name: &str,
     path: &str,
 ) -> Result<()> {
-    let abs = root.join(manifest);
-    let mut text = load_text(&abs, buffers)?;
-    text.push_str(&format!(
-        "\n[[{kind}]]\nname = \"{name}\"\npath = \"{path}\"\n"
-    ));
-    buffers.insert(abs, Some(text.into_bytes()));
-    Ok(())
+    update_manifest(root, buffers, manifest, |text| {
+        append_lines(
+            text,
+            &format!("[[{kind}]]\nname = \"{name}\"\npath = \"{path}\"\n"),
+        );
+    })
+}
+
+fn dependency_entry(name: &str, version: &str, features: &[String]) -> String {
+    if features.is_empty() {
+        format!("{name} = \"{version}\"\n")
+    } else {
+        let feats = quoted_list(features);
+        format!("{name} = {{ version = \"{version}\", features = [{feats}] }}\n")
+    }
+}
+
+fn feature_entry(name: &str, members: &[String]) -> String {
+    if members.is_empty() {
+        format!("{name} = []\n")
+    } else {
+        let list = quoted_list(members);
+        format!("{name} = [{list}]\n")
+    }
+}
+
+fn quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("\"{item}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn insert_under_section_or_append(text: &mut String, section: &str, entry: &str) {
+    if let Some(pos) = find_section(text, section) {
+        let insert = pos + section.len() + 1;
+        text.insert_str(insert, entry);
+    } else {
+        text.push_str(&format!("\n{section}\n{entry}"));
+    }
+}
+
+fn append_lines(text: &mut String, body: &str) {
+    text.push('\n');
+    text.push_str(body);
+    if !body.ends_with('\n') {
+        text.push('\n');
+    }
+}
+
+fn set_package_field(text: &mut String, field: &str, value: &str) {
+    let replacement = package_field_line(field, value);
+    let key_eq = format!("{field} =");
+    if let Some(line_start) = find_key_line(text, &key_eq) {
+        let line_end = line_end_after(text, line_start);
+        text.replace_range(line_start..line_end, &replacement);
+    } else if let Some(pos) = find_section(text, "[package]") {
+        let insert = pos + "[package]".len() + 1;
+        text.insert_str(insert, &replacement);
+    } else {
+        append_lines(text, replacement.trim_end());
+    }
+}
+
+fn package_field_line(field: &str, value: &str) -> String {
+    format!("{field} = \"{value}\"\n")
+}
+
+fn line_end_after(text: &str, line_start: usize) -> usize {
+    text[line_start..]
+        .find('\n')
+        .map(|i| line_start + i + 1)
+        .unwrap_or(text.len())
 }
 
 fn find_section(text: &str, section: &str) -> Option<usize> {
@@ -252,14 +264,19 @@ fn find_section(text: &str, section: &str) -> Option<usize> {
 }
 
 fn find_key_line(text: &str, key_eq: &str) -> Option<usize> {
-    text.find(key_eq)
+    let mut offset = 0;
+    for line in text.lines() {
+        if line.trim_start().starts_with(key_eq) {
+            return Some(offset);
+        }
+        offset += line.len() + 1;
+    }
+    None
 }
 
 fn remove_key_line(text: &str, key: &str) -> String {
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with(&format!("{key} =")))
-        .map(|l| format!("{l}\n"))
-        .collect()
+    let key_eq = format!("{key} =");
+    filter_lines_to_string(text, |line| !line.trim_start().starts_with(&key_eq))
 }
 
 fn remove_target_block(text: &str, kind: &str, name: &str) -> String {
@@ -284,26 +301,4 @@ fn remove_target_block(text: &str, kind: &str, name: &str) -> String {
         }
     }
     out
-}
-
-fn load_text(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<String> {
-    let bytes = load_buf(abs, buffers)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn load_buf(abs: &Path, buffers: &mut HashMap<PathBuf, Option<Vec<u8>>>) -> Result<Vec<u8>> {
-    if let Some(entry) = buffers.get(abs) {
-        return match entry {
-            Some(v) => Ok(v.clone()),
-            None => bail!(
-                "manifest {} was already deleted in this batch",
-                abs.display()
-            ),
-        };
-    }
-    if abs.exists() {
-        Ok(fs::read(abs)?)
-    } else {
-        Ok(Vec::new())
-    }
 }
