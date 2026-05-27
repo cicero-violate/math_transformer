@@ -285,7 +285,10 @@ pub fn render_mod(name: &str, inline: bool, body: Option<&str>) -> String {
 
 /// Render a type alias.
 pub fn render_type_alias(visibility: Option<&str>, name: &str, ty: &str) -> String {
-    render_vis_prefixed_decl(visibility, render_semicolon_decl(format!("type {name} = {ty}")))
+    render_vis_prefixed_decl(
+        visibility,
+        render_semicolon_decl(format!("type {name} = {ty}")),
+    )
 }
 
 /// Render a const or static.
