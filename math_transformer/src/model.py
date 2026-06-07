@@ -70,11 +70,13 @@ class MathRoutedTransformerBlock(nn.Module):
         x: torch.Tensor,
         nodes: list[MathNode] | None = None,
         env: dict[str, tuple[int, ...]] | None = None,
+        return_metadata: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[RouteResult] | None, MaskDiagnostics | None]:
         """
         x     : (B, T, d_model)
         nodes : list[MathNode] of length T, or None for full attention
         env   : shape/type environment for shape_compat and composition relations
+        return_metadata=False skips router/diagnostic return work on cache hits.
         Returns (output, mask, route_info, diagnostics)
         """
         B, T, _ = x.shape
@@ -83,7 +85,9 @@ class MathRoutedTransformerBlock(nn.Module):
         diag: MaskDiagnostics | None = None
 
         if nodes is not None and len(nodes) == T and self.attention_mode != "full":
-            cache = self._topology_cache or TopologyCache(maxsize=1)
+            # Do not use `or` here: TopologyCache implements __len__, so an
+            # empty shared cache is falsy and would be discarded before warming.
+            cache = self._topology_cache if self._topology_cache is not None else TopologyCache(maxsize=1)
             z = cache.get_or_encode(nodes, self.embedder)
 
             if self.attention_mode == "neighbor_sparse":
@@ -100,11 +104,15 @@ class MathRoutedTransformerBlock(nn.Module):
                 np_mask, diag = self.topology.build_detailed(nodes, z, env)
                 mask = torch.tensor(np_mask, dtype=torch.bool, device=x.device)
 
-            route_info = self.router.route_batch(nodes, z)
+            if return_metadata:
+                route_info = self.router.route_batch(nodes, z)
+            else:
+                mask = None
+                diag = None
 
         x_normed = self.norm1(x)
 
-        if self.attention_mode == "neighbor_sparse" and mask is not None:
+        if self.attention_mode == "neighbor_sparse" and nodes is not None and len(nodes) == T:
             attn_out = self.attn(x_normed, nb, valid)
         elif self.attention_mode == "full":
             attn_out = self.attn(x_normed, mask=None)
@@ -165,7 +173,9 @@ class MathRoutedTransformer(nn.Module):
     ) -> tuple[torch.Tensor, list, list] | tuple[torch.Tensor, list, list, list]:
         masks, routes, diags = [], [], []
         for layer in self.layers:
-            x, mask, route_info, diag = layer(x, nodes, env=env)
+            x, mask, route_info, diag = layer(
+                x, nodes, env=env, return_metadata=True
+            )
             masks.append(mask)
             routes.append(route_info)
             diags.append(diag)

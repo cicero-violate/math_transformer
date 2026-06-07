@@ -95,23 +95,24 @@ At `n=512`:
 
 | mode | d_blk | sparse uncached | sparse cached |
 |------|------:|----------------:|--------------:|
-| roots | 0.894 | 420.010 | 415.785 |
-| trees | 0.930 | 256.026 | 255.805 |
+| roots | 0.939 | 426.116 | **2.819** |
+| trees | 0.934 | 272.982 | **2.710** |
 
-These numbers are not explained by the Triton kernel:
+After the cache fix, these numbers are now consistent with a hot cached path:
 
-- `n=512 roots s_tri = 0.191ms`
-- `n=512 roots sparse cached block = 415.785ms`
+- `n=512 roots s_tri = 0.203ms`
+- `n=512 roots sparse cached block = 2.819ms`
+- `n=512 trees sparse cached block = 2.710ms`
 
-So the block path is still doing expensive non-kernel work. The cached sparse block is not yet
-a clean hot path.
+The uncached path still proves topology construction is expensive, but the cached path no
+longer re-enters topology construction on every forward.
 
-Likely remaining costs:
+Remaining costs:
 
-1. Recomputing or revalidating symbolic topology inputs.
-2. Python-side node embedding / route metadata work.
-3. Cache lookup and tensor movement overhead.
-4. Unconditional router/diagnostic work inside model forward.
+1. Sparse path overhead around the Triton call.
+2. Neighbor-table use and tensor dispatch overhead.
+3. Feed-forward/projection work in the block.
+4. Optional metadata work when `return_metadata=True`.
 
 The target block path should look like this:
 
@@ -124,6 +125,59 @@ not this:
 ```text
 forward -> symbolic topology/cache/router work -> neighbor tensors -> Triton kernel -> output
 ```
+
+
+---
+
+## Hot-Path Cache Fix
+
+A critical cache bug was fixed after the first CUDA/Triton run.
+
+Previous code used:
+
+```python
+cache = self._topology_cache or TopologyCache(maxsize=1)
+```
+
+Because `TopologyCache` implements `__len__`, an empty shared cache is falsy. That meant the
+shared cache was discarded before it could warm, so the supposedly cached sparse block kept
+re-entering topology construction. The fix is explicit `None` checking:
+
+```python
+cache = self._topology_cache if self._topology_cache is not None else TopologyCache(maxsize=1)
+```
+
+The benchmark also uses `return_metadata=False` for the cached sparse block timing so the hot
+path skips router/diagnostic return work while preserving the default public API.
+
+### Cached block result after the fix
+
+Run:
+
+```bash
+.venv-cuda/bin/python -m src.eval --benchmark --examples data/examples.jsonl   --sizes 64,128,256,512 --node-mode roots,trees --warmup 1 --iters 2
+```
+
+| n | mode | d_blk | sparse uncached | sparse cached |
+|---:|------|------:|----------------:|--------------:|
+| 64  | roots | 0.744 | 13.774 | **0.989** |
+| 128 | roots | 0.932 | 42.936 | **1.501** |
+| 256 | roots | 0.577 | 126.898 | **2.280** |
+| 512 | roots | 0.939 | 426.116 | **2.819** |
+| 64  | trees | 0.688 | 9.769 | **1.322** |
+| 128 | trees | 0.934 | 35.736 | **1.064** |
+| 256 | trees | 1.228 | 71.900 | **1.288** |
+| 512 | trees | 0.934 | 272.982 | **2.710** |
+
+This changes the block-level conclusion:
+
+```text
+before: cached sparse block was hundreds of ms at n=512
+ after: cached sparse block is ~2.7–2.8 ms at n=512
+```
+
+The remaining gap to `d_blk` is now small enough to be explained by Triton sparse attention
+plus neighbor-table use and sparse path overhead, not repeated topology construction.
 
 ---
 
@@ -161,9 +215,9 @@ Do not use `stk_atn` as evidence until the exception is surfaced and fixed.
 ## What Is Not Yet Proven
 
 ```text
-✗ Block-level wall-clock speedup
+✓ Cached sparse block no longer rebuilds topology on every forward
 ✗ End-to-end model speedup
-✗ A clean cached hot path with topology fully removed from forward
+✗ Cached sparse block is still slower than full dense block, though now low single-digit ms
 ✗ Valid scored-topK attention timings
 ✗ Training-speed improvement
 ```

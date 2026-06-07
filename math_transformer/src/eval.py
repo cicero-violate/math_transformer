@@ -345,12 +345,12 @@ def run_benchmark(
     ).to(device)
     # Warm the cache with one call before benchmarking
     with torch.no_grad():
-        block_sparse_c(x_dm, nodes, env=env or None)
+        block_sparse_c(x_dm, nodes, env=env or None, return_metadata=False)
 
     full_block_ms         = _timed(lambda: block_full(x_dm), n_warmup, n_iter)
     dense_masked_block_ms = _timed(lambda: block_masked(x_dm, nodes, env=env or None), n_warmup, n_iter)
     sparse_uc_block_ms    = _timed(lambda: block_sparse_uc(x_dm, nodes, env=env or None), n_warmup, n_iter)
-    sparse_c_block_ms     = _timed(lambda: block_sparse_c(x_dm, nodes, env=env or None), n_warmup, n_iter)
+    sparse_c_block_ms     = _timed(lambda: block_sparse_c(x_dm, nodes, env=env or None, return_metadata=False), n_warmup, n_iter)
 
     # ── End-to-end ────────────────────────────────────────────────────────────
     verifier = Verifier()
