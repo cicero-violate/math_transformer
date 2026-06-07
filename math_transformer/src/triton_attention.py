@@ -114,10 +114,14 @@ def triton_neighbor_attention(
     Fused neighbor-sparse attention via Triton kernel.
     Drops the Python token loop; gather + dot + softmax + weighted-sum in one kernel.
 
-    Raises RuntimeError if Triton is not installed.
+    Raises RuntimeError if Triton/CUDA is unavailable or tensors are not CUDA tensors.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("triton is not installed")
+    if not q.is_cuda or not k.is_cuda or not v.is_cuda or not neighbors.is_cuda:
+        raise RuntimeError("triton_neighbor_attention requires CUDA tensors")
+    if valid is None or not valid.is_cuda:
+        raise RuntimeError("triton_neighbor_attention requires a CUDA valid mask")
 
     B, H, T, D = q.shape
     K = neighbors.shape[1]

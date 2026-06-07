@@ -103,10 +103,10 @@ class NeighborSparseMathAttention(_AttentionBase):
         neighbors: torch.Tensor,
         valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from .sparse_attention import neighbor_attention
+        from .triton_attention import triton_neighbor_attention
         B, T, _ = x.shape
         q, k, v = self._project(x)
-        out = neighbor_attention(q, k, v, neighbors, valid)
+        out = triton_neighbor_attention(q, k, v, neighbors, valid)
         return self._collect(out, B, T)
 
 

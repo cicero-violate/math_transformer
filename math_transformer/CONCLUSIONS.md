@@ -1,169 +1,224 @@
 # Conclusions — Math-Routed Sparse Transformer
 
-**Hardware**: 4-thread CPU, Python 3.14.3, Arch Linux  
-**Run**: `scripts/benchmark_attention.sh --sizes 256,512,1024`  
-**Commit**: v5 sprint implementation (sprint 1–5 complete, 154 tests pass)
+**Hardware / runtime**: CUDA GPU, 4 CPU threads, Python 3.12.13, Arch Linux  
+**Run**: `scripts/benchmark_attention.sh --sizes 64,128,256,512 --node-mode roots,trees`  
+**Benchmark path**: CUDA/Triton-only neighbor-sparse attention. CPU fallback removed from execution.  
+**Kernel**: `src/triton_attention.py::_nbr_sparse_attn_kernel`
 
 ---
 
 ## Headline Finding
 
-**The architecture claim is now proven on CPU at n=1024.**
+**The sparse attention kernel now beats dense attention on CUDA.**
 
-With K capped at 32 and `torch.compile`, the sparse attention kernel beats dense matmul
-in wall-clock time at n=1024 in both roots and trees modes. This is the first confirmed
-crossover on real data with real topology-derived neighbors.
+The neighbor-sparse path is routed through the fused Triton kernel. In the benchmark table,
+`s_trnc == s_tri`, which means the truncated sparse attention measurement is the Triton
+kernel measurement. `s_comp` is intentionally zero because the old `torch.compile` sparse
+path is no longer used in the benchmark hot path.
 
----
+At `n=512`:
 
-## Attention-Only Timings (ms, median over 10 iters)
+- **roots**: Triton sparse attention is **3.08× faster** than dense attention.
+- **trees**: Triton sparse attention is **2.38× faster** than dense attention.
 
-All sparse runs use `max_neighbors=32` (Sprint 2 default).  
-`s_comp` = `torch.compile(neighbor_attention)` with K=32.
-
-| n | mode | rel_red | d_attn | s_trnc K=32 | s_comp K=32 | winner |
-|---|------|---------|--------|-------------|-------------|--------|
-| 256 | roots | 77.0% | 0.307 | 1.283 | 1.075 | dense (3.5×) |
-| 512 | roots | 77.4% | 5.406 | 3.156 | **1.368** | s_comp **4.0×** |
-| 1024 | roots | 77.6% | 12.688 | **6.028** | **3.544** | s_comp **3.6×** |
-| 256 | trees | 47.7% | 0.408 | 1.370 | 1.167 | dense (2.9×) |
-| 512 | trees | 47.9% | 1.997 | 3.151 | 2.262 | dense (1.1×) |
-| 1024 | trees | 48.0% | 13.253 | **7.333** | **4.243** | s_comp **3.1×** |
-
-### Key crossover observations
-
-- **Roots, n=512**: `s_comp` (1.368ms) beats `d_attn` (5.406ms) — 4× win. Uncompiled sparse
-  (3.156ms) also wins. Relation reduction 77% leaves K/n = 32/512 = 0.063.
-
-- **Roots, n=1024**: Both uncompiled (6.028ms) and compiled (3.544ms) beat dense (12.688ms).
-  K/n = 32/1024 = 0.031 — well into the sparse-wins regime.
-
-- **Trees, n=1024**: Sparse wins despite lower relation reduction (48%). Same_operator dominates
-  the topology at large n, but with K capped at 32 the kernel stays fast regardless of max_k.
-
-- **Trees, n=512**: Dense (1.997ms) narrowly beats uncompiled sparse (3.151ms) but compiled
-  (2.262ms) is close — the crossover sits between n=512 and n=1024 for trees mode.
-
-### torch.compile speedup over uncompiled sparse
-
-| n | roots speedup | trees speedup |
-|---|---------------|---------------|
-| 256 | 1.19× | 1.17× |
-| 512 | 2.31× | 1.39× |
-| 1024 | 1.70× | 1.73× |
-
-`torch.compile` consistently improves the sparse kernel. The gain is largest at n=512 roots
-(2.3×). On CPU the Inductor backend works without restriction; on CUDA it requires cc ≥ 7.0
-(blocked on GTX 1050, free on A100/H100/RTX 4090+).
+The attention bottleneck has moved: the kernel is no longer the main problem. Topology
+construction and block-level Python/symbolic overhead now dominate wall-clock time.
 
 ---
 
-## Topology Build Cost (CPU path, cache-miss)
+## Attention-Only Timings
 
-| n | mode | topo_ms | d_attn | ratio topo/attn |
-|---|------|---------|--------|-----------------|
-| 256 | roots | 76.8 | 0.307 | **250×** |
-| 512 | roots | 275.9 | 5.406 | **51×** |
-| 1024 | roots | 1014.4 | 12.688 | **80×** |
-| 256 | trees | 65.1 | 0.408 | **160×** |
-| 512 | trees | 235.0 | 1.997 | **118×** |
-| 1024 | trees | 809.0 | 13.253 | **61×** |
+All timings are milliseconds. `d_attn` is dense full attention. `s_tri` is the fused Triton
+neighbor-sparse attention kernel.
 
-Topology build is 50–250× more expensive than attention compute. This is the real bottleneck
-for the block-level timings. Sprint 4 moved matrix ops to torch/GPU but the Python embedding
-call (`embedder.encode_batch`) still runs every forward pass in the block.
+| n | mode | allowed | full | rel_red | d_attn | s_tri | dense / Triton |
+|---:|------|--------:|-----:|--------:|-------:|------:|---------------:|
+| 64  | roots | 1,030 | 4,096 | 74.85% | 0.131 | 0.084 | **1.56×** |
+| 128 | roots | 3,910 | 16,384 | 76.14% | 0.158 | 0.101 | **1.56×** |
+| 256 | roots | 15,046 | 65,536 | 77.04% | 0.209 | 0.129 | **1.62×** |
+| 512 | roots | 59,334 | 262,144 | 77.37% | 0.589 | 0.191 | **3.08×** |
+| 64  | trees | 2,162 | 4,096 | 47.22% | 0.121 | 0.083 | **1.46×** |
+| 128 | trees | 8,604 | 16,384 | 47.49% | 0.178 | 0.157 | **1.13×** |
+| 256 | trees | 34,246 | 65,536 | 47.74% | 0.196 | 0.144 | **1.36×** |
+| 512 | trees | 136,648 | 262,144 | 47.87% | 0.593 | 0.249 | **2.38×** |
 
-### Block-level timings confirm this
+### Interpretation
 
-At n=1024 roots:
-- `d_blk` (full block, no topology): **17ms**
-- `m_blk` (dense masked, with topology each call): **511ms**
-- `s_uc` / `s_c` (sparse, cached): **~1060ms**
+Roots mode is faster because it is much sparser:
 
-Even the cached sparse block is 62× slower than the full block because `embedder.encode_batch`
-runs on 1024 nodes in Python every forward call. The topology cache eliminates the matrix build
-but not the embedding recompute.
+- `n=512 roots`: 59,334 allowed edges, **77.37%** relation reduction.
+- `n=512 trees`: 136,648 allowed edges, **47.87%** relation reduction.
+
+Trees mode is more semantically connected but more expensive:
+
+- `n=512 roots`: `symbolic_dependency = 0`
+- `n=512 trees`: `symbolic_dependency = 26,060`
+
+So the tradeoff is clear:
+
+```text
+roots = higher sparsity, faster kernel
+ trees = richer symbolic dependency routing, more edges
+```
 
 ---
 
-## Relation Coverage at Scale
+## Topology Build Cost Is Now the Bottleneck
 
-With env loaded from `data/examples.jsonl`, shape_compat and composition are now active.
+The Triton attention kernel is fast. The symbolic topology builder is not.
 
-At n=1024 roots:
-- `same_operator`: 232,222 edges (dominant — 6 expression types cycle, each ~n/6 nodes share)
-- `shape_compat`: 87,210 edges
-- `composition`: 58,140 edges
-- `embedding_topk`: 6,072 edges
-- `local_window`: 3,070 edges
-- `identity`: 1,024 edges
-- `symbolic_dependency`: 0 (roots mode — single expression per node, no parent-child links)
+| n | mode | topo_ms | s_tri | topo / Triton |
+|---:|------|--------:|------:|--------------:|
+| 64  | roots | 15.897 | 0.084 | **189×** |
+| 128 | roots | 77.640 | 0.101 | **769×** |
+| 256 | roots | 256.576 | 0.129 | **1,989×** |
+| 512 | roots | 586.338 | 0.191 | **3,070×** |
+| 64  | trees | 10.742 | 0.083 | **129×** |
+| 128 | trees | 49.680 | 0.157 | **316×** |
+| 256 | trees | 164.201 | 0.144 | **1,140×** |
+| 512 | trees | 445.693 | 0.249 | **1,790×** |
 
-Relation reduction remains **77% for roots, 48% for trees** at large n — consistent across v4→v5.
+The current runtime shape is therefore:
+
+```text
+symbolic topology construction >> model/block Python overhead >> Triton attention
+```
+
+The attention kernel win is real, but it is hidden at the block/system level unless topology
+is compiled once and reused.
+
+---
+
+## Block-Level Timings Expose Hot-Path Overhead
+
+At `n=512`:
+
+| mode | d_blk | sparse uncached | sparse cached |
+|------|------:|----------------:|--------------:|
+| roots | 0.894 | 420.010 | 415.785 |
+| trees | 0.930 | 256.026 | 255.805 |
+
+These numbers are not explained by the Triton kernel:
+
+- `n=512 roots s_tri = 0.191ms`
+- `n=512 roots sparse cached block = 415.785ms`
+
+So the block path is still doing expensive non-kernel work. The cached sparse block is not yet
+a clean hot path.
+
+Likely remaining costs:
+
+1. Recomputing or revalidating symbolic topology inputs.
+2. Python-side node embedding / route metadata work.
+3. Cache lookup and tensor movement overhead.
+4. Unconditional router/diagnostic work inside model forward.
+
+The target block path should look like this:
+
+```text
+precompiled (neighbors, valid) on CUDA + projected QKV -> Triton kernel -> output
+```
+
+not this:
+
+```text
+forward -> symbolic topology/cache/router work -> neighbor tensors -> Triton kernel -> output
+```
+
+---
+
+## Scored Top-K Timing Is Currently Invalid
+
+The benchmark reports:
+
+```text
+stk_atn = 0.000
+```
+
+for every row. That means scored-topK attention is not being measured successfully. It is
+likely failing inside the guarded scored-topK timing block and being swallowed by an exception
+handler.
+
+Do not use `stk_atn` as evidence until the exception is surfaced and fixed.
 
 ---
 
 ## What Is Now Proven
 
-```
-✓ Attention-only: sparse with K=32 beats dense matmul at n≥512 on CPU (roots and trees)
-✓ torch.compile gives 1.2–2.3× additional speedup over uncompiled sparse on CPU
-✓ Relation reduction 73–77% (roots) and 47–48% (trees) is stable across hardware and scale
-✓ GPU topology build (Sprint 4): torch-native matrix ops replace NumPy, verified identical output
-✓ Triton fused kernel (Sprint 5): correct output, beats dense at small n on GTX 1050
-✓ topology_build_ms column confirms topo cost is the block-level bottleneck (50–250× attn)
+```text
+✓ CUDA/Triton neighbor-sparse attention is wired into the benchmark path
+✓ CPU fallback is removed from benchmark execution
+✓ Triton sparse attention beats dense attention for n=64..512 on this CUDA run
+✓ At n=512, sparse attention is 3.08× faster than dense in roots mode
+✓ At n=512, sparse attention is 2.38× faster than dense in trees mode
+✓ Roots preserves ~75–77% relation reduction across n=64..512
+✓ Trees preserves ~47–48% relation reduction while adding symbolic dependency edges
+✓ The bottleneck has moved from attention compute to topology/block infrastructure
 ```
 
 ---
 
 ## What Is Not Yet Proven
 
-```
-✗ Wall-clock win at the block level — topology build dwarfs attention savings
-✗ Triton kernel vs dense at n≥256 on a capable GPU (cc ≥ 7.0)
-✗ torch.compile speedup on CUDA (blocked by GTX 1050 cc 6.1)
-✗ End-to-end training speedup
+```text
+✗ Block-level wall-clock speedup
+✗ End-to-end model speedup
+✗ A clean cached hot path with topology fully removed from forward
+✗ Valid scored-topK attention timings
+✗ Training-speed improvement
 ```
 
 ---
 
-## Root Cause: Why Block Timing Still Loses
+## Architecture Verdict
 
-The cached block at n=1024 (1060ms) vs the full block (17ms) comes down to two costs
-that persist even with a warm cache:
+The central kernel-level claim is now stronger than before:
 
-1. **`embedder.encode_batch(1024 nodes)`** — pure Python loop calling numpy per node,
-   runs every forward call even on cache hits. Fix: precompute and freeze embeddings.
-2. **`router.route_batch(nodes, z)`** — called unconditionally in the block forward.
+> Math-structured sparse routing can produce a neighbor-sparse attention pattern that runs
+> faster than dense attention when executed by a fused CUDA/Triton kernel.
 
-The attention kernel itself is not the bottleneck. It is correct, fast, and at n=1024
-conclusively faster than dense. The surrounding infrastructure cost dominates.
+This is now shown directly on CUDA, not just CPU.
 
----
+However, the system-level claim is still blocked by infrastructure overhead:
 
-## Architecture Verdict After v5
+> The model cannot show wall-clock wins until symbolic topology, embedding, routing, and
+> diagnostics are removed from the repeated forward hot path.
 
-The central claim — that math-structured sequences can use neighbor-sparse attention
-faster than dense O(n²) attention — **is proven at the kernel level for n ≥ 512 on CPU**.
+The right abstraction is a two-stage pipeline:
 
-The proof is conditional:
-- K must be capped (K=32, i.e. K/n ≤ 0.063 at n=512)
-- Topology must be precomputed or cached
-- `torch.compile` (or a Triton kernel on a capable GPU) is needed to close the gap on GPU
+```text
+Stage 1: compile symbolic graph once
+         nodes + shapes + relations -> neighbors, valid, diagnostics
 
-The remaining gap between a proven kernel and a proven system is the embedding pipeline.
-That is an engineering fix (freeze embeddings, vectorize the encoder), not a fundamental
-architectural objection.
+Stage 2: run model repeatedly
+         Q, K, V + cached CUDA neighbors/valid -> Triton attention
+```
+
+The current benchmark proves Stage 2 can win. The next engineering step is to make the model
+actually use Stage 2 without re-entering Stage 1.
 
 ---
 
 ## Next Step
 
-One blocking item before claiming end-to-end speedup:
+Make cached sparse block timing approximate the kernel-level result.
 
-> **Freeze node embeddings** — compute `z = embedder.encode_batch(nodes)` once at graph
-> construction time, cache it alongside the topology. This eliminates the Python loop from
-> the hot path entirely. Expected block-level result: `s_c ≈ d_blk + attention_overhead`
-> rather than `s_c ≈ topo_build_ms`.
+Concrete target:
 
-After that, the block-level win follows from the kernel-level win already demonstrated.
+```text
+sparse_block_cached ~= dense_block + Triton_sparse_attention_overhead
+```
+
+Immediate work:
+
+1. Precompute node embeddings and topology outside `forward`.
+2. Store `neighbors` and `valid` as CUDA tensors in the cache.
+3. Add a no-diagnostics/no-router fast path for benchmark and training.
+4. Surface scored-topK exceptions instead of swallowing them.
+5. Re-run the benchmark with block-level timing after the hot path is cleaned.
+
+Success criterion:
+
+```text
+s_c at n=512 should fall from hundreds of ms to low single-digit ms.
+```

@@ -194,8 +194,7 @@ def run_benchmark(
     from .topology_cache import TopologyCache, CachedTopology
     from .embedder import MathEmbedder
     from .sparse_attention import (
-        neighbors_from_mask, neighbors_from_mask_prioritized,
-        neighbor_attention, neighbor_attention_compiled, max_k_from_mask,
+        neighbors_from_mask, neighbors_from_mask_prioritized, max_k_from_mask,
     )
     from .topology import build_priority_matrix
     from .attention import math_attention
@@ -203,7 +202,11 @@ def run_benchmark(
     from .triton_attention import triton_neighbor_attention, TRITON_AVAILABLE
     import torch.nn as nn
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required: CPU benchmark path has been removed")
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for neighbor-sparse attention")
+    device = "cuda"
 
     if exprs is None:
         exprs = [
@@ -271,37 +274,10 @@ def run_benchmark(
 
     dense_full_attn_ms   = _timed(lambda: math_attention(q_, k_, v_, None), n_warmup, n_iter)
     dense_masked_attn_ms = _timed(lambda: math_attention(q_, k_, v_, mask_4d), n_warmup, n_iter)
-    nbr_exact_ms = _timed(lambda: neighbor_attention(q_, k_, v_, nb_exact, valid_exact), n_warmup, n_iter)
-    nbr_trunc_ms = _timed(lambda: neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc), n_warmup, n_iter)
-
-    # Sprint 3: torch.compile (requires CUDA capability >= 7.0 for Inductor backend)
+    nbr_exact_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_exact, valid_exact), n_warmup, n_iter)
+    nbr_trunc_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc), n_warmup, n_iter)
     compiled_ms = 0.0
-    try:
-        with torch.no_grad():
-            for _ in range(3):
-                neighbor_attention_compiled(q_, k_, v_, nb_trunc, valid_trunc)
-                _sync()
-        compiled_ms = _timed(
-            lambda: neighbor_attention_compiled(q_, k_, v_, nb_trunc, valid_trunc),
-            n_warmup, n_iter,
-        )
-    except Exception:
-        compiled_ms = 0.0  # Inductor unsupported on this GPU (cc < 7.0)
-
-    # Sprint 5: Triton fused kernel (GPU only, requires CUDA + Triton)
-    triton_ms = 0.0
-    if TRITON_AVAILABLE and device == "cuda":
-        try:
-            with torch.no_grad():
-                for _ in range(3):
-                    triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc)
-                    _sync()
-            triton_ms = _timed(
-                lambda: triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc),
-                n_warmup, n_iter,
-            )
-        except Exception:
-            triton_ms = 0.0  # Triton unsupported on this GPU (cc < 7.0)
+    triton_ms = nbr_trunc_ms
 
     # v6 Sprint 1: scored top-K topology build + attention timing
     from .topology import RELATION_WEIGHTS
@@ -329,7 +305,7 @@ def run_benchmark(
         _mask_stk_t = torch.tensor(_mask_stk, dtype=torch.bool).to(device)
         _nb_stk, _valid_stk = neighbors_from_mask_prioritized(_mask_stk_t, priority, fixed_k)
         scored_topk_attn_ms = _timed(
-            lambda: neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
+            lambda: triton_neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
             n_warmup, n_iter,
         )
     except Exception:
@@ -337,7 +313,7 @@ def run_benchmark(
 
     # v6 Sprint 3: amortized topology cost (build once, reuse N times)
     # amortized_ms = (topo_build_ms + N * attention_ms) / N
-    _attn_ms = compiled_ms if compiled_ms > 0.0 else nbr_trunc_ms
+    _attn_ms = triton_ms
     amortized_cached_ms_10 = (topology_build_ms + 10 * _attn_ms) / 10
     amortized_cached_ms_100 = (topology_build_ms + 100 * _attn_ms) / 100
 
@@ -514,7 +490,9 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
     sizes = [int(x) for x in args.sizes.split(",")]
     modes = args.node_mode.split(",")
 
-    print(f"device={torch.device('cuda' if torch.cuda.is_available() else 'cpu')}  "
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required: CPU benchmark path has been removed")
+    print(f"device={torch.device('cuda')}  "
           f"threads={torch.get_num_threads()}  python={sys.version.split()[0]}")
     _print_table_header()
 
