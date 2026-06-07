@@ -12,19 +12,28 @@ import torch
 
 # ── Timing helpers ────────────────────────────────────────────────────────────
 
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _time_runs(fn, n_warmup: int, n_iter: int) -> dict[str, float]:
     """
     Return timing stats (ms) for fn() over n_iter calls after n_warmup warmup runs.
     Returns: min_ms, median_ms, p95_ms, mean_ms, std_ms.
+    Calls cuda.synchronize() around each timed call when on GPU.
     """
     with torch.no_grad():
         for _ in range(n_warmup):
             fn()
+            _sync()
     times = []
     with torch.no_grad():
         for _ in range(n_iter):
+            _sync()
             t0 = time.perf_counter()
             fn()
+            _sync()
             times.append((time.perf_counter() - t0) * 1000.0)
     arr = np.array(times)
     return {
@@ -211,11 +220,18 @@ def run_benchmark(
     nb_exact, valid_exact = neighbors_from_mask_prioritized(mask_t, priority, exact_k)
     nb_trunc, valid_trunc = neighbors_from_mask_prioritized(mask_t, priority, trunc_k)
 
+    # Move topology tensors to device
+    mask_t    = mask_t.to(device)
+    nb_exact  = nb_exact.to(device)
+    valid_exact = valid_exact.to(device)
+    nb_trunc  = nb_trunc.to(device)
+    valid_trunc = valid_trunc.to(device)
+
     # ── Attention-only ────────────────────────────────────────────────────────
     B, H, Dh = 1, n_heads, d_model // n_heads
-    q_ = torch.randn(B, H, n, Dh)
-    k_ = torch.randn(B, H, n, Dh)
-    v_ = torch.randn(B, H, n, Dh)
+    q_ = torch.randn(B, H, n, Dh, device=device)
+    k_ = torch.randn(B, H, n, Dh, device=device)
+    v_ = torch.randn(B, H, n, Dh, device=device)
     mask_4d = mask_t.unsqueeze(0).unsqueeze(0)
 
     dense_full_attn_ms  = _timed(lambda: math_attention(q_, k_, v_, None), n_warmup, n_iter)
@@ -224,31 +240,31 @@ def run_benchmark(
     nbr_trunc_ms = _timed(lambda: neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc), n_warmup, n_iter)
 
     # ── Block-level ───────────────────────────────────────────────────────────
-    proj = nn.Linear(z_t.shape[1], d_model, bias=False)
+    proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
     with torch.no_grad():
-        x_dm = proj(z_t.unsqueeze(0))  # (1, T, d_model)
+        x_dm = proj(z_t.to(device).unsqueeze(0))  # (1, T, d_model)
 
     block_full = MathRoutedTransformerBlock(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="full"
-    )
+    ).to(device)
     block_masked = MathRoutedTransformerBlock(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="dense_masked"
-    )
+    ).to(device)
     # Uncached sparse block — fresh cache each call
     block_sparse_uc = MathRoutedTransformerBlock(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
         max_neighbors=max_neighbors,
-    )
+    ).to(device)
     # Cached sparse block — shared cache across calls
     shared_cache = TopologyCache()
     block_sparse_c = MathRoutedTransformerBlock(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
         max_neighbors=max_neighbors, topology_cache=shared_cache,
-    )
+    ).to(device)
     # Warm the cache with one call before benchmarking
     with torch.no_grad():
         block_sparse_c(x_dm, nodes, env=env or None)
@@ -264,15 +280,15 @@ def run_benchmark(
     shared_cache_e2e = TopologyCache()
     kw = dict(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
               topk=topk, local_window=local_window, max_neighbors=max_neighbors)
-    m_full   = MathRoutedTransformer(**kw, attention_mode="full",    share_topology_cache=False)
-    m_masked = MathRoutedTransformer(**kw, attention_mode="dense_masked", share_topology_cache=False)
-    m_sparse_uc = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=False)
-    m_sparse_c  = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=True)
+    m_full   = MathRoutedTransformer(**kw, attention_mode="full",    share_topology_cache=False).to(device)
+    m_masked = MathRoutedTransformer(**kw, attention_mode="dense_masked", share_topology_cache=False).to(device)
+    m_sparse_uc = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=False).to(device)
+    m_sparse_c  = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=True).to(device)
 
-    xf = m_full.embed_nodes(nodes)
-    xm = m_masked.embed_nodes(nodes)
-    xs_uc = m_sparse_uc.embed_nodes(nodes)
-    xs_c  = m_sparse_c.embed_nodes(nodes)
+    xf    = m_full.embed_nodes(nodes).to(device)
+    xm    = m_masked.embed_nodes(nodes).to(device)
+    xs_uc = m_sparse_uc.embed_nodes(nodes).to(device)
+    xs_c  = m_sparse_c.embed_nodes(nodes).to(device)
 
     # Warm e2e cached model
     with torch.no_grad():

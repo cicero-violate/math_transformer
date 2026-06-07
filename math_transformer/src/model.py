@@ -167,4 +167,6 @@ class MathRoutedTransformer(nn.Module):
     def embed_nodes(self, nodes: list[MathNode]) -> torch.Tensor:
         """Convert MathNodes to initial embeddings: (1, T, d_model)."""
         z = self._embedder.encode_batch(nodes)
-        return self.embed_proj(torch.tensor(z, dtype=torch.float32)).unsqueeze(0)
+        device = next(self.parameters()).device
+        z_t = torch.tensor(z, dtype=torch.float32, device=device)
+        return self.embed_proj(z_t).unsqueeze(0)
