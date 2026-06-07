@@ -52,16 +52,26 @@ def _cache_key(
 
 class TopologyCache:
     """
-    In-process LRU-style cache for topology builds.
-    Keyed on (nodes_hash, env_hash, topk, local_window, max_neighbors).
+    In-process LRU-style cache for topology builds and node embeddings.
+
+    Topology keyed on (nodes_hash, env_hash, topk, local_window, max_neighbors, device).
+    Embeddings keyed on nodes_hash — encode_batch is called at most once per unique node set.
     """
 
     def __init__(self, maxsize: int = 256) -> None:
         self._store: dict[str, CachedTopology] = {}
         self._order: list[str] = []   # insertion-order eviction
+        self._z_store: dict[str, np.ndarray] = {}  # Sprint 2: frozen embeddings
         self.maxsize = maxsize
         self.cache_hits = 0
         self.cache_misses = 0
+
+    def get_or_encode(self, nodes: list[MathNode], embedder) -> np.ndarray:
+        """Return cached embedding array; compute and cache on first call."""
+        key = stable_nodes_hash(nodes)
+        if key not in self._z_store:
+            self._z_store[key] = embedder.encode_batch(nodes)
+        return self._z_store[key]
 
     def get_or_build(
         self,
@@ -85,13 +95,22 @@ class TopologyCache:
 
         self.cache_misses += 1
 
+        mode = getattr(builder, "topology_mode", "union")
+
         if use_gpu:
             Z_t = torch.tensor(z, dtype=torch.float32, device=dev)
-            mask_t, diag = builder.build_detailed_torch(nodes, Z_t, env, dev)
-            priority_t = build_priority_matrix_torch(
-                nodes, Z_t=Z_t, env=env,
-                topk=builder.topk, local_window=builder.local_window, device=dev,
-            )
+            if mode == "scored_topk":
+                mask_t, diag = builder.build_scored_topk_torch(nodes, Z_t, env, dev)
+                priority_t = build_priority_matrix_torch(
+                    nodes, Z_t=Z_t, env=env,
+                    topk=builder.topk, local_window=builder.local_window, device=dev,
+                )
+            else:
+                mask_t, diag = builder.build_detailed_torch(nodes, Z_t, env, dev)
+                priority_t = build_priority_matrix_torch(
+                    nodes, Z_t=Z_t, env=env,
+                    topk=builder.topk, local_window=builder.local_window, device=dev,
+                )
             K = max(max_neighbors if max_neighbors is not None else diag.max_k, 1)
             nb, valid = neighbors_from_priority_torch(priority_t, K)
             cached = CachedTopology(
@@ -102,7 +121,10 @@ class TopologyCache:
                 diagnostics=diag,
             )
         else:
-            np_mask, diag = builder.build_detailed(nodes, z, env)
+            if mode == "scored_topk":
+                np_mask, diag = builder.build_scored_topk(nodes, z, env)
+            else:
+                np_mask, diag = builder.build_detailed(nodes, z, env)
             mask_t = torch.tensor(np_mask, dtype=torch.bool)
             priority = build_priority_matrix(
                 nodes, z=z, env=env,
@@ -129,6 +151,7 @@ class TopologyCache:
     def clear(self) -> None:
         self._store.clear()
         self._order.clear()
+        self._z_store.clear()
         self.cache_hits = 0
         self.cache_misses = 0
 

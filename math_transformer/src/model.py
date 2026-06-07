@@ -34,6 +34,9 @@ class MathRoutedTransformerBlock(nn.Module):
         attention_mode: AttentionMode = "dense_masked",
         max_neighbors: int | None = None,
         topology_cache: TopologyCache | None = None,
+        topology_mode: str = "union",
+        fixed_k: int = 32,
+        relation_weights: dict | None = None,
     ) -> None:
         super().__init__()
         self.attention_mode = attention_mode
@@ -54,7 +57,11 @@ class MathRoutedTransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.drop = nn.Dropout(dropout)
-        self.topology = TopologyBuilder(topk=topk, local_window=local_window)
+        self.topology = TopologyBuilder(
+            topk=topk, local_window=local_window,
+            topology_mode=topology_mode, fixed_k=fixed_k,
+            relation_weights=relation_weights,
+        )
         self.embedder = MathEmbedder()
         self.router = OperatorRouter()
 
@@ -76,11 +83,11 @@ class MathRoutedTransformerBlock(nn.Module):
         diag: MaskDiagnostics | None = None
 
         if nodes is not None and len(nodes) == T and self.attention_mode != "full":
-            z = self.embedder.encode_batch(nodes)
+            cache = self._topology_cache or TopologyCache(maxsize=1)
+            z = cache.get_or_encode(nodes, self.embedder)
 
             if self.attention_mode == "neighbor_sparse":
                 # Use cache path → builds priority + prioritized neighbors
-                cache = self._topology_cache or TopologyCache(maxsize=1)
                 cached: CachedTopology = cache.get_or_build(
                     nodes, z, env, self.topology, self.max_neighbors,
                     device=x.device,
@@ -123,6 +130,9 @@ class MathRoutedTransformer(nn.Module):
         attention_mode: AttentionMode = "dense_masked",
         max_neighbors: int | None = None,
         share_topology_cache: bool = True,
+        topology_mode: str = "union",
+        fixed_k: int = 32,
+        relation_weights: dict | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -136,6 +146,9 @@ class MathRoutedTransformer(nn.Module):
                 d_model, n_heads, d_ff, dropout, topk, local_window,
                 attention_mode, max_neighbors,
                 topology_cache=shared_cache,
+                topology_mode=topology_mode,
+                fixed_k=fixed_k,
+                relation_weights=relation_weights,
             )
             for _ in range(n_layers)
         ])

@@ -76,6 +76,12 @@ class BenchmarkReport:
     compiled_sparse_attn_ms: float = 0.0
     # Sprint 5: Triton fused kernel
     triton_sparse_attn_ms: float = 0.0
+    # Sprint 6 v6: scored top-K attention (avg_k ≈ fixed_k regardless of n)
+    scored_topk_attn_ms: float = 0.0
+    scored_topk_build_ms: float = 0.0
+    # Sprint 6 v6: amortized cost (topology paid once, attention reused N times)
+    amortized_cached_ms_10: float = 0.0
+    amortized_cached_ms_100: float = 0.0
     # Block-level
     full_block_ms: float = 0.0
     dense_masked_block_ms: float = 0.0
@@ -180,6 +186,8 @@ def run_benchmark(
     exprs: list[str] | None = None,
     examples_path: str | None = None,
     save_dir: str | None = None,
+    topology_mode: str = "union",
+    fixed_k: int = 32,
 ) -> BenchmarkReport:
     from .model import MathRoutedTransformer, MathRoutedTransformerBlock
     from .topology import TopologyBuilder
@@ -295,6 +303,44 @@ def run_benchmark(
         except Exception:
             triton_ms = 0.0  # Triton unsupported on this GPU (cc < 7.0)
 
+    # v6 Sprint 1: scored top-K topology build + attention timing
+    from .topology import RELATION_WEIGHTS
+    scored_topk_build_ms = 0.0
+    scored_topk_attn_ms = 0.0
+    try:
+        _tb_stk = TopologyBuilder(
+            topk=topk, local_window=local_window,
+            topology_mode="scored_topk", fixed_k=fixed_k,
+        )
+        _embedder_stk = MathEmbedder()
+
+        def _build_scored_topk_cpu():
+            _z = _embedder_stk.encode_batch(nodes)
+            _mask, _diag = _tb_stk.build_scored_topk(nodes, _z, env or None)
+            _mt = torch.tensor(_mask, dtype=torch.bool)
+            _K = fixed_k
+            neighbors_from_mask_prioritized(_mt, priority, _K)
+
+        scored_topk_build_ms = _timed(_build_scored_topk_cpu, n_warmup=1, n_iter=5)
+
+        # Build scored_topk neighbors for attention timing
+        _z_stk = _embedder_stk.encode_batch(nodes)
+        _mask_stk, _diag_stk = _tb_stk.build_scored_topk(nodes, _z_stk, env or None)
+        _mask_stk_t = torch.tensor(_mask_stk, dtype=torch.bool).to(device)
+        _nb_stk, _valid_stk = neighbors_from_mask_prioritized(_mask_stk_t, priority, fixed_k)
+        scored_topk_attn_ms = _timed(
+            lambda: neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
+            n_warmup, n_iter,
+        )
+    except Exception:
+        pass
+
+    # v6 Sprint 3: amortized topology cost (build once, reuse N times)
+    # amortized_ms = (topo_build_ms + N * attention_ms) / N
+    _attn_ms = compiled_ms if compiled_ms > 0.0 else nbr_trunc_ms
+    amortized_cached_ms_10 = (topology_build_ms + 10 * _attn_ms) / 10
+    amortized_cached_ms_100 = (topology_build_ms + 100 * _attn_ms) / 100
+
     # ── Block-level ───────────────────────────────────────────────────────────
     proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
     with torch.no_grad():
@@ -379,6 +425,10 @@ def run_benchmark(
         nbr_sparse_trunc_ms=nbr_trunc_ms,
         compiled_sparse_attn_ms=compiled_ms,
         triton_sparse_attn_ms=triton_ms,
+        scored_topk_attn_ms=scored_topk_attn_ms,
+        scored_topk_build_ms=scored_topk_build_ms,
+        amortized_cached_ms_10=amortized_cached_ms_10,
+        amortized_cached_ms_100=amortized_cached_ms_100,
         full_block_ms=full_block_ms,
         dense_masked_block_ms=dense_masked_block_ms,
         sparse_block_uncached_ms=sparse_uc_block_ms,
@@ -432,12 +482,12 @@ def retrieval_recall_at_k(
 def _print_table_header() -> None:
     cols = (
         f"{'n':>5}  {'mode':>5}  {'allowed':>8}  {'full':>6}  "
-        f"{'avg_k':>6}  {'max_k':>5}  {'pad':>5}  "
-        f"{'sparsity':>8}  {'rel_red':>7}  "
+        f"{'avg_k':>6}  {'max_k':>5}  {'rel_red':>7}  "
         f"{'topo_ms':>8}  "
-        f"{'d_attn':>7}  {'m_attn':>7}  {'s_exct':>7}  {'s_trnc':>7}  "
-        f"{'s_comp':>7}  {'s_tri':>7}  "
-        f"{'d_blk':>7}  {'m_blk':>7}  {'s_uc':>7}  {'s_c':>7}"
+        f"{'d_attn':>7}  {'s_trnc':>7}  {'s_comp':>7}  {'s_tri':>7}  "
+        f"{'stk_bld':>8}  {'stk_atn':>8}  "
+        f"{'amrt_10':>8}  {'amrt_100':>9}  "
+        f"{'d_blk':>7}  {'s_uc':>7}  {'s_c':>7}"
     )
     print(cols)
     print("-" * len(cols))
@@ -446,14 +496,14 @@ def _print_table_header() -> None:
 def _print_row(r: BenchmarkReport) -> None:
     print(
         f"{r.n:>5}  {r.node_mode:>5}  {r.allowed_edges:>8}  {r.full_edges:>6}  "
-        f"{r.avg_k:>6.1f}  {r.max_k:>5}  {r.padding_ratio:>5.3f}  "
-        f"{r.sparsity_ratio:>8.4f}  {r.relation_reduction:>7.4f}  "
+        f"{r.avg_k:>6.1f}  {r.max_k:>5}  {r.relation_reduction:>7.4f}  "
         f"{r.topology_build_ms:>8.3f}  "
-        f"{r.dense_full_attn_ms:>7.3f}  {r.dense_masked_attn_ms:>7.3f}  "
-        f"{r.nbr_sparse_exact_ms:>7.3f}  {r.nbr_sparse_trunc_ms:>7.3f}  "
+        f"{r.dense_full_attn_ms:>7.3f}  {r.nbr_sparse_trunc_ms:>7.3f}  "
         f"{r.compiled_sparse_attn_ms:>7.3f}  {r.triton_sparse_attn_ms:>7.3f}  "
-        f"{r.full_block_ms:>7.3f}  {r.dense_masked_block_ms:>7.3f}  "
-        f"{r.sparse_block_uncached_ms:>7.3f}  {r.sparse_block_cached_ms:>7.3f}"
+        f"{r.scored_topk_build_ms:>8.3f}  {r.scored_topk_attn_ms:>8.3f}  "
+        f"{r.amortized_cached_ms_10:>8.3f}  {r.amortized_cached_ms_100:>9.3f}  "
+        f"{r.full_block_ms:>7.3f}  {r.sparse_block_uncached_ms:>7.3f}  "
+        f"{r.sparse_block_cached_ms:>7.3f}"
     )
     if r.by_relation:
         for rel, cnt in r.by_relation.items():
@@ -484,6 +534,8 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
                 n_iter=args.iters,
                 examples_path=args.examples,
                 save_dir=save_dir,
+                topology_mode=args.topology_mode,
+                fixed_k=args.fixed_k,
             )
             _print_row(r)
 
@@ -498,6 +550,9 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
     parser.add_argument("--max-neighbors", type=int, default=32, dest="max_neighbors")
+    parser.add_argument("--topology-mode", default="union", dest="topology_mode",
+                        choices=["union", "scored_topk"])
+    parser.add_argument("--fixed-k", type=int, default=32, dest="fixed_k")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--examples", default=None)
