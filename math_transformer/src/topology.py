@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
+import torch
 from .ir import MathNode
 from .embedder import MathEmbedder, pairwise_cosine
 
@@ -298,3 +299,237 @@ class TopologyBuilder:
 
     def edge_count(self, mask: np.ndarray) -> int:
         return int(mask.sum())
+
+    def build_detailed_torch(
+        self,
+        nodes: list[MathNode],
+        Z_t: torch.Tensor | None = None,
+        env: dict[str, tuple[int, ...]] | None = None,
+        device: torch.device | str = "cpu",
+    ) -> tuple[torch.Tensor, MaskDiagnostics]:
+        """
+        GPU-resident topology build.
+        Returns (bool mask tensor on device, MaskDiagnostics).
+        """
+        n = len(nodes)
+        device = torch.device(device)
+
+        if Z_t is None and self.topk > 0:
+            z_np = self.embedder.encode_batch(nodes)
+            Z_t = torch.tensor(z_np, dtype=torch.float32, device=device)
+
+        sym    = symbolic_dependency_matrix_torch(nodes, device)
+        sameop = same_operator_matrix_torch(nodes, device)
+        topk_m = (
+            embedding_topk_matrix_torch(Z_t, self.topk, device)
+            if Z_t is not None and self.topk > 0
+            else torch.zeros(n, n, dtype=torch.bool, device=device)
+        )
+        local = local_window_matrix_torch(n, self.local_window, device)
+        ident = identity_matrix_torch(n, device)
+        sc    = (
+            shape_compat_matrix_torch(nodes, env, device)
+            if self.use_shape_compat and env
+            else torch.zeros(n, n, dtype=torch.bool, device=device)
+        )
+        comp  = (
+            composition_matrix_torch(nodes, env, device)
+            if self.use_composition and env
+            else torch.zeros(n, n, dtype=torch.bool, device=device)
+        )
+
+        mask = sym | sameop | topk_m | local | ident | sc | comp
+
+        per_row_k = mask.sum(dim=1)
+        max_k = int(per_row_k.max().item()) if n > 0 else 0
+        avg_k = float(per_row_k.float().mean().item()) if n > 0 else 0.0
+        allowed = int(mask.sum().item())
+        padding_ratio = 1.0 - (allowed / (n * max_k)) if max_k > 0 else 0.0
+
+        diag = MaskDiagnostics(
+            n=n,
+            full_edges=n * n,
+            allowed_edges=allowed,
+            sparsity_ratio=allowed / (n * n) if n > 0 else 0.0,
+            relation_reduction=1.0 - allowed / (n * n) if n > 0 else 0.0,
+            avg_k=avg_k,
+            max_k=max_k,
+            padding_ratio=padding_ratio,
+            by_relation={
+                "symbolic_dependency": int(sym.sum().item()),
+                "same_operator":       int(sameop.sum().item()),
+                "embedding_topk":      int(topk_m.sum().item()),
+                "local_window":        int(local.sum().item()),
+                "shape_compat":        int(sc.sum().item()),
+                "composition":         int(comp.sum().item()),
+                "identity":            int(ident.sum().item()),
+            },
+        )
+        return mask, diag
+
+
+# ── GPU-native relation matrix builders ──────────────────────────────────────
+
+def identity_matrix_torch(n: int, device: torch.device) -> torch.Tensor:
+    return torch.eye(n, dtype=torch.bool, device=device)
+
+
+def local_window_matrix_torch(n: int, w: int, device: torch.device) -> torch.Tensor:
+    idx = torch.arange(n, device=device)
+    return (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= w
+
+
+def same_operator_matrix_torch(nodes: list[MathNode], device: torch.device) -> torch.Tensor:
+    unique_ops = list(dict.fromkeys(nd.op for nd in nodes))
+    op_to_id = {op: i for i, op in enumerate(unique_ops)}
+    op_ids = torch.tensor([op_to_id[nd.op] for nd in nodes], dtype=torch.long, device=device)
+    mat = op_ids.unsqueeze(0) == op_ids.unsqueeze(1)
+    mat.fill_diagonal_(False)
+    return mat
+
+
+def symbolic_dependency_matrix_torch(
+    nodes: list[MathNode], device: torch.device
+) -> torch.Tensor:
+    n = len(nodes)
+    mat = torch.zeros(n, n, dtype=torch.bool, device=device)
+    rows: list[int] = []
+    cols: list[int] = []
+    for i, node in enumerate(nodes):
+        for child in node.args:
+            for j, other in enumerate(nodes):
+                if other is child or other == child:
+                    rows.extend([i, j])
+                    cols.extend([j, i])
+    if rows:
+        r = torch.tensor(rows, dtype=torch.long, device=device)
+        c = torch.tensor(cols, dtype=torch.long, device=device)
+        mat[r, c] = True
+    return mat
+
+
+def embedding_topk_matrix_torch(
+    Z: torch.Tensor, k: int, device: torch.device
+) -> torch.Tensor:
+    n = Z.shape[0]
+    mat = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if k <= 0 or n <= 1:
+        return mat
+    Z = Z.to(device)
+    norms = Z.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    Zn = Z / norms
+    sims = Zn @ Zn.T  # (n, n) cosine similarity
+    sims.fill_diagonal_(-2.0)
+    k_actual = min(k, n - 1)
+    topk_idx = sims.topk(k_actual, dim=1).indices  # (n, k_actual)
+    rows = torch.arange(n, device=device).unsqueeze(1).expand_as(topk_idx)
+    mat[rows.reshape(-1), topk_idx.reshape(-1)] = True
+    mat = mat | mat.T
+    return mat
+
+
+def shape_compat_matrix_torch(
+    nodes: list[MathNode],
+    env: dict[str, tuple[int, ...]] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    n = len(nodes)
+    mat = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if not env:
+        return mat
+    try:
+        from .shape import infer_shape
+    except ImportError:
+        return mat
+    shapes = [infer_shape(nd, env) for nd in nodes]
+    rows: list[int] = []
+    cols: list[int] = []
+    for i in range(n):
+        if shapes[i] is None:
+            continue
+        for j in range(i + 1, n):
+            if shapes[j] is not None and shapes[i] == shapes[j]:
+                rows.extend([i, j])
+                cols.extend([j, i])
+    if rows:
+        mat[
+            torch.tensor(rows, dtype=torch.long, device=device),
+            torch.tensor(cols, dtype=torch.long, device=device),
+        ] = True
+    return mat
+
+
+def composition_matrix_torch(
+    nodes: list[MathNode],
+    env: dict[str, tuple[int, ...]] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    n = len(nodes)
+    mat = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if not env:
+        return mat
+    try:
+        from .shape import infer_shape
+    except ImportError:
+        return mat
+    out_shapes = [infer_shape(nd, env) for nd in nodes]
+    rows: list[int] = []
+    cols: list[int] = []
+    for j, node_j in enumerate(nodes):
+        for arg in node_j.args:
+            arg_shape = infer_shape(arg, env)
+            if arg_shape is None:
+                continue
+            for i in range(n):
+                if i == j:
+                    continue
+                if out_shapes[i] is not None and out_shapes[i] == arg_shape:
+                    rows.extend([i, j])
+                    cols.extend([j, i])
+    if rows:
+        mat[
+            torch.tensor(rows, dtype=torch.long, device=device),
+            torch.tensor(cols, dtype=torch.long, device=device),
+        ] = True
+    return mat
+
+
+def build_priority_matrix_torch(
+    nodes: list[MathNode],
+    Z_t: torch.Tensor | None = None,
+    env: dict[str, tuple[int, ...]] | None = None,
+    topk: int = 4,
+    local_window: int = 2,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """GPU-resident priority matrix. Returns (n, n) int8 tensor on `device`."""
+    n = len(nodes)
+    device = torch.device(device)
+
+    if Z_t is None and topk > 0:
+        embedder = MathEmbedder()
+        z_np = embedder.encode_batch(nodes)
+        Z_t = torch.tensor(z_np, dtype=torch.float32, device=device)
+
+    layers = [
+        ("identity",            identity_matrix_torch(n, device)),
+        ("symbolic_dependency", symbolic_dependency_matrix_torch(nodes, device)),
+        ("composition",         composition_matrix_torch(nodes, env, device)),
+        ("shape_compat",        shape_compat_matrix_torch(nodes, env, device)),
+        ("embedding_topk",
+            embedding_topk_matrix_torch(Z_t, topk, device)
+            if Z_t is not None and topk > 0
+            else torch.zeros(n, n, dtype=torch.bool, device=device)),
+        ("local_window",        local_window_matrix_torch(n, local_window, device)),
+        ("same_operator",       same_operator_matrix_torch(nodes, device)),
+    ]
+
+    priority = torch.zeros(n, n, dtype=torch.int8, device=device)
+    for name, mat in layers:
+        p = RELATION_PRIORITY[name]
+        unset = (priority == 0) & mat
+        existing = (priority > 0) & (priority > p) & mat
+        priority[unset] = p
+        priority[existing] = p
+
+    return priority

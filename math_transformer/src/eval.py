@@ -65,11 +65,17 @@ class BenchmarkReport:
     sparsity_ratio: float
     relation_reduction: float
     device: str = "cpu"
+    # Sprint 1: topology build time (CPU path, cache-miss cost)
+    topology_build_ms: float = 0.0
     # Attention-only
     dense_full_attn_ms: float = 0.0
     dense_masked_attn_ms: float = 0.0
     nbr_sparse_exact_ms: float = 0.0
     nbr_sparse_trunc_ms: float = 0.0
+    # Sprint 3: torch.compile sparse kernel
+    compiled_sparse_attn_ms: float = 0.0
+    # Sprint 5: Triton fused kernel
+    triton_sparse_attn_ms: float = 0.0
     # Block-level
     full_block_ms: float = 0.0
     dense_masked_block_ms: float = 0.0
@@ -89,11 +95,15 @@ class BenchmarkReport:
             f"edges: full={self.full_edges}  allowed={self.allowed_edges}",
             f"avg_k={self.avg_k:.2f}  max_k={self.max_k}  padding={self.padding_ratio:.3f}",
             f"sparsity={self.sparsity_ratio:.4f}  rel_reduce={self.relation_reduction:.4f}",
+            "--- topology build ---",
+            f"  build_ms={self.topology_build_ms:.3f}ms",
             "--- attention only ---",
             f"  dense_full={self.dense_full_attn_ms:.3f}ms  "
             f"dense_masked={self.dense_masked_attn_ms:.3f}ms  "
             f"nbr_exact={self.nbr_sparse_exact_ms:.3f}ms  "
-            f"nbr_trunc={self.nbr_sparse_trunc_ms:.3f}ms",
+            f"nbr_trunc={self.nbr_sparse_trunc_ms:.3f}ms  "
+            f"compiled={self.compiled_sparse_attn_ms:.3f}ms  "
+            f"triton={self.triton_sparse_attn_ms:.3f}ms",
             "--- block level ---",
             f"  full={self.full_block_ms:.3f}ms  "
             f"dense_masked={self.dense_masked_block_ms:.3f}ms  "
@@ -177,11 +187,12 @@ def run_benchmark(
     from .embedder import MathEmbedder
     from .sparse_attention import (
         neighbors_from_mask, neighbors_from_mask_prioritized,
-        neighbor_attention, max_k_from_mask,
+        neighbor_attention, neighbor_attention_compiled, max_k_from_mask,
     )
     from .topology import build_priority_matrix
     from .attention import math_attention
     from .verifier import Verifier
+    from .triton_attention import triton_neighbor_attention, TRITON_AVAILABLE
     import torch.nn as nn
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,6 +228,22 @@ def run_benchmark(
     exact_k = diag.max_k
     trunc_k = max_neighbors if max_neighbors is not None else max(exact_k // 2, 1)
 
+    # Sprint 1: time the full topology build pipeline (CPU path, cache-miss cost)
+    _embedder_topo = MathEmbedder()
+    _tb_topo = TopologyBuilder(topk=topk, local_window=local_window)
+
+    def _build_topo_cpu():
+        _z = _embedder_topo.encode_batch(nodes)
+        _mask, _diag = _tb_topo.build_detailed(nodes, _z, env or None)
+        _prio = build_priority_matrix(
+            nodes, z=_z, env=env or None, topk=topk, local_window=local_window,
+        )
+        _mt = torch.tensor(_mask, dtype=torch.bool)
+        _K = max(max_neighbors if max_neighbors is not None else _diag.max_k, 1)
+        neighbors_from_mask_prioritized(_mt, _prio, _K)
+
+    topology_build_ms = _timed(_build_topo_cpu, n_warmup=1, n_iter=5)
+
     nb_exact, valid_exact = neighbors_from_mask_prioritized(mask_t, priority, exact_k)
     nb_trunc, valid_trunc = neighbors_from_mask_prioritized(mask_t, priority, trunc_k)
 
@@ -234,10 +261,39 @@ def run_benchmark(
     v_ = torch.randn(B, H, n, Dh, device=device)
     mask_4d = mask_t.unsqueeze(0).unsqueeze(0)
 
-    dense_full_attn_ms  = _timed(lambda: math_attention(q_, k_, v_, None), n_warmup, n_iter)
+    dense_full_attn_ms   = _timed(lambda: math_attention(q_, k_, v_, None), n_warmup, n_iter)
     dense_masked_attn_ms = _timed(lambda: math_attention(q_, k_, v_, mask_4d), n_warmup, n_iter)
     nbr_exact_ms = _timed(lambda: neighbor_attention(q_, k_, v_, nb_exact, valid_exact), n_warmup, n_iter)
     nbr_trunc_ms = _timed(lambda: neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc), n_warmup, n_iter)
+
+    # Sprint 3: torch.compile (requires CUDA capability >= 7.0 for Inductor backend)
+    compiled_ms = 0.0
+    try:
+        with torch.no_grad():
+            for _ in range(3):
+                neighbor_attention_compiled(q_, k_, v_, nb_trunc, valid_trunc)
+                _sync()
+        compiled_ms = _timed(
+            lambda: neighbor_attention_compiled(q_, k_, v_, nb_trunc, valid_trunc),
+            n_warmup, n_iter,
+        )
+    except Exception:
+        compiled_ms = 0.0  # Inductor unsupported on this GPU (cc < 7.0)
+
+    # Sprint 5: Triton fused kernel (GPU only, requires CUDA + Triton)
+    triton_ms = 0.0
+    if TRITON_AVAILABLE and device == "cuda":
+        try:
+            with torch.no_grad():
+                for _ in range(3):
+                    triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc)
+                    _sync()
+            triton_ms = _timed(
+                lambda: triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc),
+                n_warmup, n_iter,
+            )
+        except Exception:
+            triton_ms = 0.0  # Triton unsupported on this GPU (cc < 7.0)
 
     # ── Block-level ───────────────────────────────────────────────────────────
     proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
@@ -316,10 +372,13 @@ def run_benchmark(
         sparsity_ratio=diag.sparsity_ratio,
         relation_reduction=diag.relation_reduction,
         device=device,
+        topology_build_ms=topology_build_ms,
         dense_full_attn_ms=dense_full_attn_ms,
         dense_masked_attn_ms=dense_masked_attn_ms,
         nbr_sparse_exact_ms=nbr_exact_ms,
         nbr_sparse_trunc_ms=nbr_trunc_ms,
+        compiled_sparse_attn_ms=compiled_ms,
+        triton_sparse_attn_ms=triton_ms,
         full_block_ms=full_block_ms,
         dense_masked_block_ms=dense_masked_block_ms,
         sparse_block_uncached_ms=sparse_uc_block_ms,
@@ -375,7 +434,9 @@ def _print_table_header() -> None:
         f"{'n':>5}  {'mode':>5}  {'allowed':>8}  {'full':>6}  "
         f"{'avg_k':>6}  {'max_k':>5}  {'pad':>5}  "
         f"{'sparsity':>8}  {'rel_red':>7}  "
+        f"{'topo_ms':>8}  "
         f"{'d_attn':>7}  {'m_attn':>7}  {'s_exct':>7}  {'s_trnc':>7}  "
+        f"{'s_comp':>7}  {'s_tri':>7}  "
         f"{'d_blk':>7}  {'m_blk':>7}  {'s_uc':>7}  {'s_c':>7}"
     )
     print(cols)
@@ -387,8 +448,10 @@ def _print_row(r: BenchmarkReport) -> None:
         f"{r.n:>5}  {r.node_mode:>5}  {r.allowed_edges:>8}  {r.full_edges:>6}  "
         f"{r.avg_k:>6.1f}  {r.max_k:>5}  {r.padding_ratio:>5.3f}  "
         f"{r.sparsity_ratio:>8.4f}  {r.relation_reduction:>7.4f}  "
+        f"{r.topology_build_ms:>8.3f}  "
         f"{r.dense_full_attn_ms:>7.3f}  {r.dense_masked_attn_ms:>7.3f}  "
         f"{r.nbr_sparse_exact_ms:>7.3f}  {r.nbr_sparse_trunc_ms:>7.3f}  "
+        f"{r.compiled_sparse_attn_ms:>7.3f}  {r.triton_sparse_attn_ms:>7.3f}  "
         f"{r.full_block_ms:>7.3f}  {r.dense_masked_block_ms:>7.3f}  "
         f"{r.sparse_block_uncached_ms:>7.3f}  {r.sparse_block_cached_ms:>7.3f}"
     )
@@ -434,7 +497,7 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=4, dest="n_heads")
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
-    parser.add_argument("--max-neighbors", type=int, default=None, dest="max_neighbors")
+    parser.add_argument("--max-neighbors", type=int, default=32, dest="max_neighbors")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--examples", default=None)

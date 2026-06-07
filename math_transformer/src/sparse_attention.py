@@ -119,6 +119,57 @@ def neighbor_attention(
     return out
 
 
+def neighbors_from_priority_torch(
+    priority: torch.Tensor,  # (T, T) int8 on any device; 0=disconnected, 1-7=priority
+    max_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    GPU-native equivalent of neighbors_from_mask_prioritized.
+    Sort each row by priority ascending (0=disconnected pushed past end), keep top max_k.
+    Always returns (T, max_k) tensors, padding with self-index when max_k > T.
+
+    Returns
+    -------
+    neighbors : (T, max_k) LongTensor
+    valid     : (T, max_k) BoolTensor
+    """
+    T = priority.shape[0]
+    device = priority.device
+
+    sort_key = priority.to(torch.float32)
+    sort_key = sort_key.masked_fill(priority == 0, 256.0)
+
+    _, sorted_idx = torch.sort(sort_key, dim=1, stable=True)  # (T, T)
+
+    # Expand to (T, max_k): take min(max_k, T) from sorted, pad rest with self-index
+    take = min(max_k, T)
+    top_idx = sorted_idx[:, :take]  # (T, take)
+
+    if take < max_k:
+        self_pad = torch.arange(T, device=device).unsqueeze(1).expand(T, max_k - take)
+        top_idx = torch.cat([top_idx, self_pad], dim=1)  # (T, max_k)
+
+    # Check validity only for the real (non-padded) positions
+    top_prio = priority.to(torch.int32).gather(1, top_idx)  # (T, max_k)
+    valid = top_prio > 0
+    if take < max_k:
+        valid[:, take:] = False  # padding slots are never valid
+
+    self_idx = torch.arange(T, device=device).unsqueeze(1).expand_as(top_idx)
+    neighbors = torch.where(valid, top_idx, self_idx)
+
+    return neighbors, valid
+
+
 def max_k_from_mask(mask: torch.Tensor) -> int:
     """Return the maximum number of allowed neighbors across all rows."""
     return int(mask.sum(dim=-1).max().item())
+
+
+# Sprint 3: torch.compile wrapper compiled once at import time.
+try:
+    neighbor_attention_compiled = torch.compile(neighbor_attention)
+    _COMPILED_AVAILABLE = True
+except Exception:
+    neighbor_attention_compiled = neighbor_attention
+    _COMPILED_AVAILABLE = False

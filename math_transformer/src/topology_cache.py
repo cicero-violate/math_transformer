@@ -11,10 +11,10 @@ from .topology import MaskDiagnostics
 
 @dataclass
 class CachedTopology:
-    mask: torch.Tensor         # (T, T) bool
-    priority: np.ndarray       # (T, T) int8
-    neighbors: torch.Tensor    # (T, K) long
-    valid: torch.Tensor        # (T, K) bool
+    mask: torch.Tensor                      # (T, T) bool
+    priority: np.ndarray | torch.Tensor    # (T, T) int8
+    neighbors: torch.Tensor                 # (T, K) long
+    valid: torch.Tensor                     # (T, K) bool
     diagnostics: MaskDiagnostics
 
 
@@ -38,6 +38,7 @@ def _cache_key(
     topk: int,
     local_window: int,
     max_neighbors: int | None,
+    device: str = "cpu",
 ) -> str:
     return "|".join([
         stable_nodes_hash(nodes),
@@ -45,6 +46,7 @@ def _cache_key(
         str(topk),
         str(local_window),
         str(max_neighbors),
+        device,
     ])
 
 
@@ -66,13 +68,16 @@ class TopologyCache:
         nodes: list[MathNode],
         z: np.ndarray,
         env: dict | None,
-        builder,                      # TopologyBuilder instance
+        builder,                          # TopologyBuilder instance
         max_neighbors: int | None = None,
+        device: torch.device | None = None,
     ) -> CachedTopology:
-        from .topology import build_priority_matrix
-        from .sparse_attention import neighbors_from_mask_prioritized
+        from .topology import build_priority_matrix, build_priority_matrix_torch
+        from .sparse_attention import neighbors_from_mask_prioritized, neighbors_from_priority_torch
 
-        key = _cache_key(nodes, env, builder.topk, builder.local_window, max_neighbors)
+        dev = device if device is not None else torch.device("cpu")
+        use_gpu = dev.type != "cpu"
+        key = _cache_key(nodes, env, builder.topk, builder.local_window, max_neighbors, str(dev))
 
         if key in self._store:
             self.cache_hits += 1
@@ -80,28 +85,39 @@ class TopologyCache:
 
         self.cache_misses += 1
 
-        np_mask, diag = builder.build_detailed(nodes, z, env)
-        mask_t = torch.tensor(np_mask, dtype=torch.bool)
+        if use_gpu:
+            Z_t = torch.tensor(z, dtype=torch.float32, device=dev)
+            mask_t, diag = builder.build_detailed_torch(nodes, Z_t, env, dev)
+            priority_t = build_priority_matrix_torch(
+                nodes, Z_t=Z_t, env=env,
+                topk=builder.topk, local_window=builder.local_window, device=dev,
+            )
+            K = max(max_neighbors if max_neighbors is not None else diag.max_k, 1)
+            nb, valid = neighbors_from_priority_torch(priority_t, K)
+            cached = CachedTopology(
+                mask=mask_t,
+                priority=priority_t,
+                neighbors=nb,
+                valid=valid,
+                diagnostics=diag,
+            )
+        else:
+            np_mask, diag = builder.build_detailed(nodes, z, env)
+            mask_t = torch.tensor(np_mask, dtype=torch.bool)
+            priority = build_priority_matrix(
+                nodes, z=z, env=env,
+                topk=builder.topk, local_window=builder.local_window,
+            )
+            K = max(max_neighbors if max_neighbors is not None else diag.max_k, 1)
+            nb, valid = neighbors_from_mask_prioritized(mask_t, priority, K)
+            cached = CachedTopology(
+                mask=mask_t,
+                priority=priority,
+                neighbors=nb,
+                valid=valid,
+                diagnostics=diag,
+            )
 
-        priority = build_priority_matrix(
-            nodes, z=z, env=env,
-            topk=builder.topk, local_window=builder.local_window,
-        )
-
-        K = max_neighbors if max_neighbors is not None else diag.max_k
-        K = max(K, 1)
-
-        nb, valid = neighbors_from_mask_prioritized(mask_t, priority, K)
-
-        cached = CachedTopology(
-            mask=mask_t,
-            priority=priority,
-            neighbors=nb,
-            valid=valid,
-            diagnostics=diag,
-        )
-
-        # Evict oldest if full
         if len(self._store) >= self.maxsize:
             oldest = self._order.pop(0)
             self._store.pop(oldest, None)

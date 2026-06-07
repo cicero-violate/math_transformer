@@ -82,7 +82,8 @@ class MathRoutedTransformerBlock(nn.Module):
                 # Use cache path → builds priority + prioritized neighbors
                 cache = self._topology_cache or TopologyCache(maxsize=1)
                 cached: CachedTopology = cache.get_or_build(
-                    nodes, z, env, self.topology, self.max_neighbors
+                    nodes, z, env, self.topology, self.max_neighbors,
+                    device=x.device,
                 )
                 mask = cached.mask.to(x.device)
                 nb = cached.neighbors.to(x.device)
