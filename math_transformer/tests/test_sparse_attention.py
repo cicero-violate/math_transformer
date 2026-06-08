@@ -308,3 +308,15 @@ def test_neighbor_sparse_selector_modes_in_model_block(selector):
     assert mask is not None
     assert routes is not None
     assert diag is not None
+
+
+def test_prioritized_zero_priority_sorts_last_under_truncation():
+    import numpy as np
+    from src.sparse_attention import neighbors_from_mask_prioritized
+
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    priority = np.array([[0, 7, 1, 2]], dtype=np.int8)
+    nb, valid = neighbors_from_mask_prioritized(mask, priority, max_k=3)
+
+    assert valid[0].all()
+    assert nb[0].tolist() == [2, 3, 1]

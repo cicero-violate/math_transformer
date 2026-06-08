@@ -5,7 +5,13 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from src.triton_attention import triton_neighbor_attention, triton_neighbor_attention_flat, TRITON_AVAILABLE
+from src.triton_attention import (
+    triton_neighbor_attention,
+    triton_neighbor_attention_flat,
+    triton_neighbor_attention_flat_block_t,
+    triton_neighbor_attention_outproj,
+    TRITON_AVAILABLE,
+)
 from src.sparse_attention import neighbor_attention
 
 
@@ -109,6 +115,49 @@ def test_triton_flat_matches_bhtd_wrapper():
     expected = out_bhtd.transpose(1, 2).reshape(B, T, H * D)
     assert out_flat.shape == expected.shape
     assert torch.allclose(out_flat, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("block_t", [2, 4])
+def test_triton_flat_block_t_matches_flat(block_t):
+    B, H, T, D, K = 2, 4, 37, 16, 8
+    torch.manual_seed(17)
+    q = torch.randn(B, H, T, D, device=DEVICE)
+    k = torch.randn(B, H, T, D, device=DEVICE)
+    v = torch.randn(B, H, T, D, device=DEVICE)
+    neighbors, valid = _make_sparse_neighbors(T, K, DEVICE)
+    valid_i8 = valid.to(torch.int8)
+
+    expected = triton_neighbor_attention_flat(q, k, v, neighbors, valid_i8)
+    out = triton_neighbor_attention_flat_block_t(
+        q, k, v, neighbors, valid_i8, block_t=block_t
+    )
+
+    assert out.shape == expected.shape
+    assert torch.allclose(out, expected, atol=2e-4, rtol=2e-4), (
+        f"max diff: {(out - expected).abs().max().item():.2e}"
+    )
+
+
+def test_triton_attention_outproj_matches_flat_plus_linear():
+    B, H, T, D, K = 1, 4, 16, 16, 8
+    torch.manual_seed(13)
+    q = torch.randn(B, H, T, D, device=DEVICE)
+    k = torch.randn(B, H, T, D, device=DEVICE)
+    v = torch.randn(B, H, T, D, device=DEVICE)
+    neighbors, valid = _make_sparse_neighbors(T, K, DEVICE)
+    valid_i8 = valid.to(torch.int8)
+    d_model = H * D
+    weight = torch.randn(d_model, d_model, device=DEVICE)
+    bias = torch.randn(d_model, device=DEVICE)
+
+    flat = triton_neighbor_attention_flat(q, k, v, neighbors, valid_i8)
+    expected = torch.nn.functional.linear(flat, weight, bias)
+    out = triton_neighbor_attention_outproj(q, k, v, neighbors, valid_i8, weight, bias)
+
+    assert out.shape == expected.shape
+    assert torch.allclose(out, expected, atol=3e-4, rtol=3e-4), (
+        f"max diff: {(out - expected).abs().max().item():.2e}"
+    )
 
 
 def test_triton_all_invalid_row_gives_zero():

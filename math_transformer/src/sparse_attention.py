@@ -64,9 +64,11 @@ def neighbors_from_mask_prioritized(
 
         if priority is not None:
             prow = priority[i]  # (T,) int8
-            # Sort by priority ascending; ties broken by index
+            # Sort by priority ascending; disconnected priority=0 is lowest and
+            # must be pushed after real edges before truncation.
             nbrs_np = row_idx.numpy()
-            prios = prow[nbrs_np]
+            prios = prow[nbrs_np].astype(np.int16)
+            prios = np.where(prios == 0, 256, prios)
             order = np.argsort(prios, kind="stable")
             row_idx_sorted = row_idx[torch.from_numpy(order)]
         else:

@@ -186,3 +186,71 @@ def test_train_accepts_step_overrides(tmp_path):
     state = torch.load(ckpt_path, map_location="cpu")
     assert state["config"]["training"]["max_steps"] == 2
     assert state["config"]["eval"]["interval"] == 1
+
+
+def test_train_accepts_v7_sparse_overrides_and_writes_loss_csv(tmp_path):
+    from src.synthetic_data import generate_splits
+    from src.train import train
+    import csv
+
+    generate_splits(
+        tmp_path / "synthetic",
+        train=4,
+        val=0,
+        test=0,
+        seed=12,
+        route_fraction=1.0,
+    )
+    cfg = {
+        "model": {
+            "d_model": 16,
+            "n_heads": 2,
+            "n_layers": 1,
+            "d_ff": 32,
+            "dropout": 0.0,
+            "topk": 1,
+            "local_window": 1,
+        },
+        "training": {
+            "batch_size": 1,
+            "lr": 1.0e-3,
+            "max_steps": 100,
+            "warmup_steps": 0,
+        },
+        "data": {
+            "path": "data/examples.jsonl",
+            "max_seq_len": 32,
+        },
+        "eval": {
+            "interval": 1,
+            "metrics": ["route_accuracy"],
+        },
+    }
+    cfg_path = tmp_path / "v7_train.yaml"
+    ckpt_path = tmp_path / "v7.pt"
+    csv_path = tmp_path / "loss.csv"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    train(
+        str(cfg_path),
+        save_checkpoint=str(ckpt_path),
+        data_path_override=str(tmp_path / "synthetic" / "train.jsonl"),
+        max_steps_override=2,
+        eval_interval_override=1,
+        attention_mode_override="neighbor_sparse",
+        topology_mode_override="middle_preserving_topk",
+        fixed_k_override=4,
+        max_neighbors_override=4,
+        middle_bridge_width_override=1,
+        device_override="cpu",
+        save_loss_csv=str(csv_path),
+    )
+
+    assert ckpt_path.exists()
+    rows = list(csv.DictReader(csv_path.open()))
+    assert len(rows) == 2
+    assert rows[0]["attention_mode"] == "neighbor_sparse"
+    assert rows[0]["topology_mode"] == "middle_preserving_topk"
+    assert rows[0]["fixed_k"] == "4"
+    assert rows[0]["max_neighbors"] == "4"
+    assert rows[0]["middle_bridge_width"] == "1"

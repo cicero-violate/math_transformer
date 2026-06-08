@@ -101,7 +101,7 @@ def test_same_operator_not_dominant_with_default_weights():
 def test_relation_weights_contain_all_expected_keys():
     expected = {
         "identity", "symbolic_dependency", "composition",
-        "shape_compat", "embedding", "local_window", "same_operator",
+        "shape_compat", "middle_bridge", "embedding", "local_window", "same_operator",
     }
     assert set(RELATION_WEIGHTS.keys()) == expected
 

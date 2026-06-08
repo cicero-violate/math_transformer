@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from .ir import MathNode
 from .embedder import MathEmbedder, pairwise_cosine
+from .middle_preserving_topology import middle_bridge_matrix, middle_bridge_matrix_torch
 
 
 # ── Individual relation matrices ──────────────────────────────────────────────
@@ -132,6 +133,7 @@ RELATION_PRIORITY: dict[str, int] = {
     "identity":            1,
     "symbolic_dependency": 2,
     "composition":         3,
+    "middle_bridge":       4,
     "shape_compat":        4,
     "embedding_topk":      5,
     "local_window":        6,
@@ -145,6 +147,8 @@ def build_priority_matrix(
     env: dict[str, tuple[int, ...]] | None = None,
     topk: int = 4,
     local_window: int = 2,
+    include_middle_bridge: bool = False,
+    middle_bridge_width: int = 0,
 ) -> np.ndarray:
     """
     Returns an (n, n) int matrix where each cell holds the highest-priority
@@ -161,6 +165,9 @@ def build_priority_matrix(
         ("identity",            identity_matrix(n)),
         ("symbolic_dependency", symbolic_dependency_matrix(nodes)),
         ("composition",         composition_matrix(nodes, env)),
+        ("middle_bridge",       middle_bridge_matrix(n, middle_bridge_width)
+                                  if include_middle_bridge
+                                  else np.zeros((n, n), dtype=bool)),
         ("shape_compat",        shape_compatibility_matrix(nodes, env)),
         ("embedding_topk",      embedding_topk_matrix(z, topk) if z is not None and topk > 0
                                 else np.zeros((n, n), dtype=bool)),
@@ -221,6 +228,7 @@ RELATION_WEIGHTS: dict[str, float] = {
     "symbolic_dependency":  1.0,
     "composition":          0.9,
     "shape_compat":         0.8,
+    "middle_bridge":        0.7,
     "embedding":            0.6,   # applied to continuous cosine similarity
     "local_window":         0.4,
     "same_operator":        0.1,
@@ -234,6 +242,8 @@ def build_scored_topk_mask(
     fixed_k: int = 32,
     local_window: int = 2,
     weights: dict[str, float] | None = None,
+    include_middle_bridge: bool = False,
+    middle_bridge_width: int = 0,
 ) -> tuple[np.ndarray, "MaskDiagnostics"]:
     """
     Score-based top-K mask: each row keeps the fixed_k highest-scoring neighbors.
@@ -255,6 +265,7 @@ def build_scored_topk_mask(
     sym     = symbolic_dependency_matrix(nodes)
     comp    = composition_matrix(nodes, env)
     sc      = shape_compatibility_matrix(nodes, env)
+    middle  = middle_bridge_matrix(n, middle_bridge_width) if include_middle_bridge else np.zeros((n, n), dtype=bool)
     local   = local_window_matrix(n, local_window)
     sameop  = same_operator_matrix(nodes)
 
@@ -268,6 +279,7 @@ def build_scored_topk_mask(
     score += w["symbolic_dependency"] * sym.astype(np.float32)
     score += w["composition"]         * comp.astype(np.float32)
     score += w["shape_compat"]        * sc.astype(np.float32)
+    score += w["middle_bridge"]       * middle.astype(np.float32)
     score += w["local_window"]        * local.astype(np.float32)
     score += w["same_operator"]       * sameop.astype(np.float32)
     score += w["embedding"]           * cos_sim
@@ -298,6 +310,7 @@ def build_scored_topk_mask(
             "symbolic_dependency": int((mask & sym).sum()),
             "composition":         int((mask & comp).sum()),
             "shape_compat":        int((mask & sc).sum()),
+            "middle_bridge":       int((mask & middle).sum()),
             "local_window":        int((mask & local).sum()),
             "same_operator":       int((mask & sameop).sum()),
             "identity":            int((mask & ident).sum()),
@@ -314,6 +327,8 @@ def build_scored_topk_mask_torch(
     fixed_k: int,
     local_window: int,
     weights: dict[str, float] | None,
+    include_middle_bridge: bool,
+    middle_bridge_width: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, "MaskDiagnostics"]:
     """GPU-resident scored top-K mask. Mirrors build_scored_topk_mask."""
@@ -324,6 +339,11 @@ def build_scored_topk_mask_torch(
     sym     = symbolic_dependency_matrix_torch(nodes, device).float()
     comp    = composition_matrix_torch(nodes, env, device).float()
     sc      = shape_compat_matrix_torch(nodes, env, device).float()
+    middle  = (
+        middle_bridge_matrix_torch(n, middle_bridge_width, device=device).float()
+        if include_middle_bridge
+        else torch.zeros(n, n, dtype=torch.float32, device=device)
+    )
     local   = local_window_matrix_torch(n, local_window, device).float()
     sameop  = same_operator_matrix_torch(nodes, device).float()
 
@@ -332,6 +352,7 @@ def build_scored_topk_mask_torch(
         + w["symbolic_dependency"] * sym
         + w["composition"]         * comp
         + w["shape_compat"]        * sc
+        + w["middle_bridge"]       * middle
         + w["local_window"]        * local
         + w["same_operator"]       * sameop
     )
@@ -369,6 +390,7 @@ def build_scored_topk_mask_torch(
             "symbolic_dependency": int((mask & sym.bool()).sum().item()),
             "composition":         int((mask & comp.bool()).sum().item()),
             "shape_compat":        int((mask & sc.bool()).sum().item()),
+            "middle_bridge":       int((mask & middle.bool()).sum().item()),
             "local_window":        int((mask & local.bool()).sum().item()),
             "same_operator":       int((mask & sameop.bool()).sum().item()),
             "identity":            int((mask & ident.bool()).sum().item()),
@@ -386,6 +408,7 @@ class TopologyBuilder:
 
     topology_mode="union"       — OR of all relation matrices (v1–v5 behaviour)
     topology_mode="scored_topk" — weighted score → top-K per row (v6, O(nK))
+    topology_mode="middle_preserving_topk" — scored top-K plus middle bridges (v7)
     """
 
     def __init__(
@@ -397,6 +420,7 @@ class TopologyBuilder:
         topology_mode: str = "union",
         fixed_k: int = 32,
         relation_weights: dict[str, float] | None = None,
+        middle_bridge_width: int = 0,
     ) -> None:
         self.topk = topk
         self.local_window = local_window
@@ -405,7 +429,12 @@ class TopologyBuilder:
         self.topology_mode = topology_mode
         self.fixed_k = fixed_k
         self.relation_weights = relation_weights
+        self.middle_bridge_width = middle_bridge_width
         self.embedder = MathEmbedder()
+
+    @property
+    def include_middle_bridge(self) -> bool:
+        return self.topology_mode == "middle_preserving_topk"
 
     def build(
         self,
@@ -413,7 +442,7 @@ class TopologyBuilder:
         z: np.ndarray | None = None,
         env: dict[str, tuple[int, ...]] | None = None,
     ) -> np.ndarray:
-        if self.topology_mode == "scored_topk":
+        if self.topology_mode in ("scored_topk", "middle_preserving_topk"):
             mask, _ = self.build_scored_topk(nodes, z, env)
             return mask
         mask, _ = self.build_detailed(nodes, z, env)
@@ -432,6 +461,8 @@ class TopologyBuilder:
             fixed_k=self.fixed_k,
             local_window=self.local_window,
             weights=self.relation_weights,
+            include_middle_bridge=self.include_middle_bridge,
+            middle_bridge_width=self.middle_bridge_width,
         )
 
     def build_scored_topk_torch(
@@ -450,6 +481,8 @@ class TopologyBuilder:
             fixed_k=self.fixed_k,
             local_window=self.local_window,
             weights=self.relation_weights,
+            include_middle_bridge=self.include_middle_bridge,
+            middle_bridge_width=self.middle_bridge_width,
             device=device,
         )
 
@@ -713,6 +746,8 @@ def build_priority_matrix_torch(
     topk: int = 4,
     local_window: int = 2,
     device: torch.device | str = "cpu",
+    include_middle_bridge: bool = False,
+    middle_bridge_width: int = 0,
 ) -> torch.Tensor:
     """GPU-resident priority matrix. Returns (n, n) int8 tensor on `device`."""
     n = len(nodes)
@@ -727,6 +762,10 @@ def build_priority_matrix_torch(
         ("identity",            identity_matrix_torch(n, device)),
         ("symbolic_dependency", symbolic_dependency_matrix_torch(nodes, device)),
         ("composition",         composition_matrix_torch(nodes, env, device)),
+        ("middle_bridge",
+            middle_bridge_matrix_torch(n, middle_bridge_width, device=device)
+            if include_middle_bridge
+            else torch.zeros(n, n, dtype=torch.bool, device=device)),
         ("shape_compat",        shape_compat_matrix_torch(nodes, env, device)),
         ("embedding_topk",
             embedding_topk_matrix_torch(Z_t, topk, device)

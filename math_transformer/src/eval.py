@@ -90,6 +90,9 @@ class BenchmarkReport:
     dense_masked_block_ms: float = 0.0
     sparse_block_uncached_ms: float = 0.0
     sparse_block_cached_ms: float = 0.0
+    prepared_static_sparse_block_ms: float = 0.0
+    prepared_static_sparse_attention_ms: float = 0.0
+    prepared_static_sparse_non_attention_ms: float = 0.0
     # End-to-end
     full_e2e_ms: float = 0.0
     masked_e2e_ms: float = 0.0
@@ -128,7 +131,10 @@ class BenchmarkReport:
             f"  full={self.full_block_ms:.3f}ms  "
             f"dense_masked={self.dense_masked_block_ms:.3f}ms  "
             f"sparse_uncached={self.sparse_block_uncached_ms:.3f}ms  "
-            f"sparse_cached={self.sparse_block_cached_ms:.3f}ms",
+            f"sparse_cached={self.sparse_block_cached_ms:.3f}ms  "
+            f"prepared_static={self.prepared_static_sparse_block_ms:.3f}ms  "
+            f"prepared_attn={self.prepared_static_sparse_attention_ms:.3f}ms  "
+            f"prepared_non_attn={self.prepared_static_sparse_non_attention_ms:.3f}ms",
             "--- end to end ---",
             f"  full={self.full_e2e_ms:.3f}ms  "
             f"masked={self.masked_e2e_ms:.3f}ms  "
@@ -255,9 +261,11 @@ def run_benchmark(
     save_dir: str | None = None,
     topology_mode: str = "union",
     fixed_k: int = 32,
+    middle_bridge_width: int = 0,
     selector_alpha: float = 1.0,
     selector_beta: float = 1.0,
     selector_candidate_neighbors: int | None = None,
+    profile_prepared_block: bool = False,
 ) -> BenchmarkReport:
     from .model import MathRoutedTransformer, MathRoutedTransformerBlock
     from .topology import TopologyBuilder
@@ -301,12 +309,30 @@ def run_benchmark(
     z = embedder.encode_batch(nodes)
     z_t = torch.from_numpy(z).float()
 
-    tb = TopologyBuilder(topk=topk, local_window=local_window)
-    np_mask, diag = tb.build_detailed(nodes, z, env or None)
+    tb = TopologyBuilder(
+        topk=topk,
+        local_window=local_window,
+        topology_mode=topology_mode,
+        fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
+    )
+
+    def _build_mask(builder: TopologyBuilder, z_arr: np.ndarray):
+        if getattr(builder, "topology_mode", "union") in ("scored_topk", "middle_preserving_topk"):
+            return builder.build_scored_topk(nodes, z_arr, env or None)
+        return builder.build_detailed(nodes, z_arr, env or None)
+
+    np_mask, diag = _build_mask(tb, z)
     mask_t = torch.tensor(np_mask, dtype=torch.bool)
 
     priority = build_priority_matrix(
-        nodes, z=z, env=env or None, topk=topk, local_window=local_window
+        nodes,
+        z=z,
+        env=env or None,
+        topk=topk,
+        local_window=local_window,
+        include_middle_bridge=tb.include_middle_bridge,
+        middle_bridge_width=middle_bridge_width,
     )
     exact_k = diag.max_k
     trunc_k = max_neighbors if max_neighbors is not None else max(exact_k // 2, 1)
@@ -317,13 +343,25 @@ def run_benchmark(
 
     # Sprint 1: time the full topology build pipeline (CPU path, cache-miss cost)
     _embedder_topo = MathEmbedder()
-    _tb_topo = TopologyBuilder(topk=topk, local_window=local_window)
+    _tb_topo = TopologyBuilder(
+        topk=topk,
+        local_window=local_window,
+        topology_mode=topology_mode,
+        fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
+    )
 
     def _build_topo_cpu():
         _z = _embedder_topo.encode_batch(nodes)
-        _mask, _diag = _tb_topo.build_detailed(nodes, _z, env or None)
+        _mask, _diag = _build_mask(_tb_topo, _z)
         _prio = build_priority_matrix(
-            nodes, z=_z, env=env or None, topk=topk, local_window=local_window,
+            nodes,
+            z=_z,
+            env=env or None,
+            topk=topk,
+            local_window=local_window,
+            include_middle_bridge=_tb_topo.include_middle_bridge,
+            middle_bridge_width=middle_bridge_width,
         )
         _mt = torch.tensor(_mask, dtype=torch.bool)
         _K = max(max_neighbors if max_neighbors is not None else _diag.max_k, 1)
@@ -364,6 +402,11 @@ def run_benchmark(
     _tb_stk = TopologyBuilder(
         topk=topk, local_window=local_window,
         topology_mode="scored_topk", fixed_k=fixed_k,
+    )
+    _tb_v7 = TopologyBuilder(
+        topk=topk, local_window=local_window,
+        topology_mode="middle_preserving_topk", fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
     )
     _embedder_stk = MathEmbedder()
 
@@ -462,6 +505,9 @@ def run_benchmark(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
         max_neighbors=max_neighbors,
+        topology_mode=topology_mode,
+        fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
     ).to(device)
     # Cached sparse block — shared cache across calls
     shared_cache = TopologyCache()
@@ -469,6 +515,9 @@ def run_benchmark(
         d_model=d_model, n_heads=n_heads, d_ff=d_ff,
         topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
         max_neighbors=max_neighbors, topology_cache=shared_cache,
+        topology_mode=topology_mode,
+        fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
     ).to(device)
     # Warm the cache with one call before benchmarking
     with torch.no_grad():
@@ -479,6 +528,44 @@ def run_benchmark(
     sparse_uc_block_ms    = _timed(lambda: block_sparse_uc(x_dm, nodes, env=env or None), n_warmup, n_iter)
     sparse_c_block_ms     = _timed(lambda: block_sparse_c(x_dm, nodes, env=env or None, return_metadata=False), n_warmup, n_iter)
     selector_results["topology_only"]["cached_block_ms"] = float(sparse_c_block_ms)
+    prepared_static_sparse_block_ms = 0.0
+    prepared_static_sparse_attention_ms = 0.0
+    prepared_static_sparse_non_attention_ms = 0.0
+    if profile_prepared_block:
+        prepared_cache = TopologyCache()
+        block_prepared = MathRoutedTransformerBlock(
+            d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
+            max_neighbors=max_neighbors, topology_cache=prepared_cache,
+            topology_mode=topology_mode,
+            fixed_k=fixed_k,
+            middle_bridge_width=middle_bridge_width,
+        ).to(device)
+        block_prepared.eval()
+        with torch.no_grad():
+            block_prepared.prepare_static_topology(nodes, env=env or None, device=torch.device(device))
+            block_prepared.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+
+        def _profile_prepared_once() -> dict[str, float]:
+            with torch.no_grad():
+                _, timings = block_prepared.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+            return timings
+
+        prepared_samples = []
+        with torch.no_grad():
+            for _ in range(n_warmup):
+                _profile_prepared_once()
+            for _ in range(n_iter):
+                prepared_samples.append(_profile_prepared_once())
+
+        prepared_totals = np.array([t.get("total_block_ms", 0.0) for t in prepared_samples])
+        prepared_attns = np.array([t.get("attention_kernel_ms", 0.0) for t in prepared_samples])
+        prepared_static_sparse_block_ms = float(np.median(prepared_totals))
+        prepared_static_sparse_attention_ms = float(np.median(prepared_attns))
+        prepared_static_sparse_non_attention_ms = max(
+            0.0,
+            prepared_static_sparse_block_ms - prepared_static_sparse_attention_ms,
+        )
 
     for selector in ("kmip_only", "symbolic_kmip", "symbolic_candidate_kmip"):
         selector_cache = TopologyCache()
@@ -487,6 +574,9 @@ def run_benchmark(
             d_model=d_model, n_heads=n_heads, d_ff=d_ff,
             topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
             max_neighbors=selector_cache_k, topology_cache=selector_cache,
+            topology_mode=topology_mode,
+            fixed_k=fixed_k,
+            middle_bridge_width=middle_bridge_width,
             sparse_selector=selector,
             selector_alpha=selector_alpha,
             selector_beta=selector_beta,
@@ -506,7 +596,9 @@ def run_benchmark(
 
     shared_cache_e2e = TopologyCache()
     kw = dict(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
-              topk=topk, local_window=local_window, max_neighbors=max_neighbors)
+              topk=topk, local_window=local_window, max_neighbors=max_neighbors,
+              topology_mode=topology_mode, fixed_k=fixed_k,
+              middle_bridge_width=middle_bridge_width)
     m_full   = MathRoutedTransformer(**kw, attention_mode="full",    share_topology_cache=False).to(device)
     m_masked = MathRoutedTransformer(**kw, attention_mode="dense_masked", share_topology_cache=False).to(device)
     m_sparse_uc = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=False).to(device)
@@ -559,6 +651,9 @@ def run_benchmark(
         dense_masked_block_ms=dense_masked_block_ms,
         sparse_block_uncached_ms=sparse_uc_block_ms,
         sparse_block_cached_ms=sparse_c_block_ms,
+        prepared_static_sparse_block_ms=prepared_static_sparse_block_ms,
+        prepared_static_sparse_attention_ms=prepared_static_sparse_attention_ms,
+        prepared_static_sparse_non_attention_ms=prepared_static_sparse_non_attention_ms,
         full_e2e_ms=full_e2e_ms,
         masked_e2e_ms=masked_e2e_ms,
         sparse_e2e_uncached_ms=sparse_uc_e2e_ms,
@@ -585,6 +680,7 @@ def run_quality_eval(
     device: str | None = None,
     topology_mode: str = "union",
     fixed_k: int = 32,
+    middle_bridge_width: int = 0,
     relation_weights: dict[str, float] | None = None,
 ) -> list[QualityReport]:
     from .model import MathRoutedTransformer
@@ -607,6 +703,7 @@ def run_quality_eval(
         local_window=local_window,
         topology_mode=topology_mode,
         fixed_k=fixed_k,
+        middle_bridge_width=middle_bridge_width,
         relation_weights=relation_weights,
     )
     dense = MathRoutedTransformer(
@@ -729,7 +826,7 @@ def _print_table_header() -> None:
         f"{'d_attn':>7}  {'s_trnc':>7}  {'s_comp':>7}  {'s_tri':>7}  "
         f"{'stk_bld':>8}  {'stk_atn':>8}  "
         f"{'amrt_10':>8}  {'amrt_100':>9}  "
-        f"{'d_blk':>7}  {'s_uc':>7}  {'s_c':>7}"
+        f"{'d_blk':>7}  {'s_uc':>7}  {'s_c':>7}  {'p_blk':>7}  {'p_attn':>7}  {'p_non':>7}"
     )
     print(cols)
     print("-" * len(cols))
@@ -745,7 +842,10 @@ def _print_row(r: BenchmarkReport) -> None:
         f"{r.scored_topk_build_ms:>8.3f}  {r.scored_topk_attn_ms:>8.3f}  "
         f"{r.amortized_cached_ms_10:>8.3f}  {r.amortized_cached_ms_100:>9.3f}  "
         f"{r.full_block_ms:>7.3f}  {r.sparse_block_uncached_ms:>7.3f}  "
-        f"{r.sparse_block_cached_ms:>7.3f}"
+        f"{r.sparse_block_cached_ms:>7.3f}  "
+        f"{r.prepared_static_sparse_block_ms:>7.3f}  "
+        f"{r.prepared_static_sparse_attention_ms:>7.3f}  "
+        f"{r.prepared_static_sparse_non_attention_ms:>7.3f}"
     )
     if r.by_relation:
         for rel, cnt in r.by_relation.items():
@@ -789,9 +889,11 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
                 save_dir=save_dir,
                 topology_mode=args.topology_mode,
                 fixed_k=args.fixed_k,
+                middle_bridge_width=args.middle_bridge_width,
                 selector_alpha=args.selector_alpha,
                 selector_beta=args.selector_beta,
                 selector_candidate_neighbors=args.selector_candidate_neighbors,
+                profile_prepared_block=args.profile_prepared_block,
             )
             _print_row(r)
 
@@ -814,6 +916,7 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
         device=args.quality_device,
         topology_mode=args.topology_mode,
         fixed_k=args.fixed_k,
+        middle_bridge_width=args.middle_bridge_width,
         relation_weights=relation_weights,
     )
     print(f"examples={args.examples}  checkpoint={args.checkpoint or 'random_init'}")
@@ -824,6 +927,7 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Eval / benchmark Math-Routed Transformer")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument('--profile-prepared-block', action="store_true", dest="profile_prepared_block")
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--sizes", default="8,16,32")
     parser.add_argument("--node-mode", default="roots,trees", dest="node_mode")
@@ -835,8 +939,9 @@ def main() -> None:
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
     parser.add_argument("--max-neighbors", type=int, default=DEFAULT_MAX_NEIGHBORS, dest="max_neighbors")
     parser.add_argument("--topology-mode", default="union", dest="topology_mode",
-                        choices=["union", "scored_topk"])
+                        choices=["union", "scored_topk", "middle_preserving_topk"])
     parser.add_argument("--fixed-k", type=int, default=32, dest="fixed_k")
+    parser.add_argument("--middle-bridge-width", type=int, default=0, dest="middle_bridge_width")
     parser.add_argument("--selector-alpha", type=float, default=1.0, dest="selector_alpha")
     parser.add_argument("--selector-beta", type=float, default=1.0, dest="selector_beta")
     parser.add_argument(

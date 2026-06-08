@@ -7,7 +7,12 @@ from src.parser import parse
 from src.normalize import normalize
 from src.embedder import MathEmbedder
 from src.topology import TopologyBuilder
-from src.topology_cache import TopologyCache, stable_nodes_hash, stable_env_hash
+from src.topology_cache import (
+    TopologyCache,
+    page_neighbor_table,
+    stable_nodes_hash,
+    stable_env_hash,
+)
 
 ENV = {"A": (32, 64), "x": (64,), "b": (32,)}
 EXPRS = ["add(matmul(A, x), b)", "matmul(A, x)", "grad(f, x)", "sum(i, x_i)"]
@@ -165,3 +170,51 @@ def test_cached_topology_build_faster_than_uncached():
     assert avg_hit_ms < avg_cold_ms, (
         f"Cache hit ({avg_hit_ms:.4f}ms) not faster than cold build ({avg_cold_ms:.4f}ms)"
     )
+
+
+def test_page_neighbor_table_round_trips_materialization():
+    neighbors = torch.arange(10 * 3).reshape(10, 3)
+    valid = torch.ones(10, 3, dtype=torch.bool)
+    valid[-1, -1] = False
+
+    paged = page_neighbor_table(neighbors, valid, page_size=4)
+
+    assert paged.num_pages == 3
+    assert paged.padded_length == 12
+    assert paged.neighbor_pages.shape == (3, 4, 3)
+    assert torch.equal(paged.materialize_neighbors(), neighbors.long())
+    assert torch.equal(paged.materialize_valid(), valid)
+    assert torch.equal(paged.materialize_valid_i8(), valid.char())
+    page_neighbors, page_valid_i8 = paged.page(0)
+    assert page_neighbors.shape == (4, 3)
+    assert page_valid_i8.dtype == torch.int8
+
+
+def test_topology_cache_get_or_build_paged_uses_fixed_k_shape():
+    nodes = _nodes(16)
+    z = MathEmbedder().encode_batch(nodes)
+    tb = TopologyBuilder(
+        topk=2,
+        local_window=1,
+        topology_mode="middle_preserving_topk",
+        fixed_k=4,
+        middle_bridge_width=1,
+    )
+    cache = TopologyCache()
+    paged_cached = cache.get_or_build_paged(
+        nodes, z, ENV, tb,
+        max_neighbors=4,
+        page_size=5,
+    )
+    paged = paged_cached.paged_neighbors
+
+    assert paged.length == 16
+    assert paged.k == 4
+    assert paged.page_size == 5
+    assert paged.num_pages == 4
+    assert paged.materialize_neighbors().shape == (16, 4)
+    assert paged.materialize_valid_i8().shape == (16, 4)
+
+    again = cache.get_or_build_paged(nodes, z, ENV, tb, max_neighbors=4, page_size=5)
+    assert again is paged_cached
+    assert cache.cache_hits >= 1

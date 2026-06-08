@@ -9,9 +9,9 @@
 
 ## Headline Finding
 
-The CUDA/Triton sparse attention kernel is validated, but the full sparse block only wins in selected cases.
+The CUDA/Triton sparse attention kernel is validated, and v7 now proves the topology itself can be compiled into a true fixed-`K` graph. Cached sparse blocks can beat dense blocks in the large-tree operating point, but uncached topology construction remains offline-only.
 
-The important correction is that the benchmark is **not** measuring attention over every allowed topology edge. It is measuring a routed top-`K` sparse attention path:
+The earlier correction still matters: legacy benchmarks were not measuring attention over every allowed topology edge. They measured a routed top-`K` sparse attention path:
 
 ```text
 symbolic topology -> priority neighbors -> top-K selected neighbors -> Triton attention
@@ -29,7 +29,7 @@ not with:
 allowed_edges * D
 ```
 
-The `allowed` column describes the full symbolic topology. The Triton kernel consumes the truncated neighbor table determined by `--max-neighbors`.
+For legacy `union` topology, the `allowed` column describes the full symbolic topology while the Triton kernel consumes the truncated neighbor table determined by `--max-neighbors`. For v7 `middle_preserving_topk`, the topology itself is already fixed-`K`, so `allowed ≈ T*K`.
 
 ---
 
@@ -72,6 +72,16 @@ The hot path now includes these optimizations:
     - `--data`
     - `--max-steps`
     - `--eval-interval`
+17. v7 adds an opt-in topology mode:
+    - `--topology-mode middle_preserving_topk`
+    - `--middle-bridge-width N`
+18. v7 adds a middle-context bridge relation:
+    - `middle_bridge`
+    - default scored-topK weight `0.7`
+    - priority `4`
+19. Benchmark construction now honors `--topology-mode` and `--fixed-k` in the main reported topology path.
+20. `TopologyCache` keys now include topology mode, `fixed_k`, and `middle_bridge_width`, preventing stale reuse across routing modes.
+21. Priority truncation now pushes disconnected priority `0` behind real edges instead of sorting it first.
 
 CUDA correctness status:
 
@@ -79,6 +89,184 @@ CUDA correctness status:
 .venv-cuda/bin/python -m pytest -q tests/test_triton_attention.py
 9 passed
 ```
+
+---
+
+## v7 Fixed-K Middle-Preserving Topology Result
+
+v7 applies the lost-in-the-middle routing lesson by adding an explicit middle bridge relation to scored top-`K` topology construction:
+
+```text
+A = alpha * I + beta * C + gamma * G
+```
+
+Where:
+
+```text
+I = identity/self route
+C = existing symbolic/local/composition/shape route
+G = middle_bridge route
+```
+
+The new mode is opt-in:
+
+```bash
+scripts/benchmark_attention.sh \
+  --sizes 1024 \
+  --node-mode trees \
+  --topology-mode middle_preserving_topk \
+  --fixed-k 16 \
+  --max-neighbors 16 \
+  --middle-bridge-width 1
+```
+
+Observed result:
+
+```text
+n=1024  mode=trees
+allowed = 16,384
+full    = 1,048,576
+avg_k   = 16.0
+max_k   = 16
+rel_red = 0.9844
+
+middle_bridge = 2,907
+s_tri = 0.299 ms
+d_attn = 1.959 ms
+s_c = 2.296 ms
+d_blk = 2.454 ms
+```
+
+Interpretation:
+
+- v7 is now a true fixed-`K` topology, not a huge union mask with runtime truncation.
+- `allowed = 1024 * 16 = 16,384`, which confirms the graph itself is bounded.
+- `middle_bridge: 2,907` confirms middle-preserving edges survive top-`K` selection.
+- Sparse Triton attention is about `1.959 / 0.299 = 6.55x` faster than dense attention in this run.
+- Cached sparse block crossed dense-block parity in this run: `2.296 ms < 2.454 ms`.
+- Uncached sparse remains invalid for live inference: `s_uc = 912.766 ms`.
+
+### Before / After
+
+| measurement | before: legacy tree topology | after: v7 middle-preserving topK |
+|-------------|-----------------------------:|---------------------------------:|
+| allowed edges | 545,422 | 16,384 |
+| avg_k | 532.6 | 16.0 |
+| max_k | 778 | 16 |
+| relation reduction | 0.4798 | 0.9844 |
+| same_operator selected/covered | 416,316 | 1,922 |
+| middle_bridge | n/a | 2,907 |
+| Triton sparse attention | 0.325 ms class | 0.299 ms |
+| cached sparse block | 2.927 ms class | 2.296 ms |
+
+The graph-size reduction is:
+
+```text
+545,422 / 16,384 = 33.3x smaller
+```
+
+Same-operator dominance also dropped sharply:
+
+```text
+416,316 / 1,922 = 216.6x lower
+```
+
+### What v7 Proves
+
+```text
+✓ The topology itself can be fixed-K, not merely runtime-truncated.
+✓ Middle-context bridge edges can survive scored top-K selection.
+✓ Cached sparse block parity can be crossed at n=1024 trees, K=16.
+✓ The benchmark now correctly reports the selected topology mode.
+✓ v7 can run inside the actual training loop with CUDA neighbor-sparse attention.
+✓ v7 K=16 preserves full-attention route quality on the current synthetic validation split.
+```
+
+### v7 Training + Validation Result
+
+Training command:
+
+```bash
+.venv-cuda/bin/python -m src.train \
+  --config configs/tiny.yaml \
+  --data data/synthetic/train.jsonl \
+  --attention-mode neighbor_sparse \
+  --topology-mode middle_preserving_topk \
+  --fixed-k 16 \
+  --max-neighbors 16 \
+  --middle-bridge-width 1 \
+  --device cuda \
+  --max-steps 1000 \
+  --eval-interval 100 \
+  --save-checkpoint runs/checkpoints/v7_k16.pt \
+  --save-loss-csv runs/train_curves/v7_k16.csv
+```
+
+Observed training behavior:
+
+```text
+checkpoint = runs/checkpoints/v7_k16.pt
+loss at step 0   = 2.1444
+loss at step 100 = 0.7210
+loss at step 200 = 0.0066
+loss at step 900 = 0.0008
+post-warmup step time = roughly 4-7 ms in the printed checkpoints
+```
+
+Validation command:
+
+```bash
+.venv-cuda/bin/python -m src.eval \
+  --quality \
+  --examples data/synthetic/val.jsonl \
+  --checkpoint runs/checkpoints/v7_k16.pt \
+  --topology-mode middle_preserving_topk \
+  --fixed-k 16 \
+  --quality-k 16 \
+  --quality-device cuda
+```
+
+Validation result:
+
+```text
+examples = 6,068
+full route_acc = 1.0000
+v7 topology_only K=16 route_acc = 1.0000
+dense_agree = 1.0000
+```
+
+Per-expert validation result:
+
+```text
+affine_expert      999/999  = 1.0000
+constraint_expert 1024/1024 = 1.0000
+generic_expert    1015/1015 = 1.0000
+grad_expert        983/983  = 1.0000
+matmul_expert     1024/1024 = 1.0000
+reduction_expert  1023/1023 = 1.0000
+```
+
+Interpretation:
+
+```text
+Q_full = 1.0000
+Q_v7,K=16 = 1.0000
+Q_v7,K=16 / Q_full = 1.0
+```
+
+This passes the current quality gate for the synthetic route task. Sparse v7 K=16 made exactly the same route decisions as full attention on the same checkpoint weights.
+
+### What v7 Does Not Prove
+
+```text
+✗ Better prediction quality than dense attention
+✗ Better generalization on harder held-out templates
+✗ Better next-token modeling
+✗ Universal speedup across roots/trees/repeated runs
+✗ Live topology construction viability
+```
+
+v7 is now both a scalability improvement and a validated sparse training path for the current synthetic route task. It is still not a claim that v7 is smarter than dense attention.
 
 ---
 
@@ -659,6 +847,11 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✓ Synthetic route/shape data generation works and is deterministic
 ✓ Per-expert quality diagnostics identify class-specific failures
 ✓ topology_only at K=16 preserves full-attention decisions on current synthetic route validation
+✓ v7 middle_preserving_topk compiles the tree topology directly to fixed K=16
+✓ v7 inserts selected middle_bridge edges into the sparse topology
+✓ v7 cached sparse block beats dense block in the observed n=1024 trees, K=16 run
+✓ v7 K=16 trained checkpoint reaches 1.0000 validation route accuracy on current synthetic split
+✓ v7 K=16 has dense_agree=1.0000 against full attention on the same checkpoint
 ```
 
 ---
@@ -676,6 +869,9 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✗ Generalization to held-out synthetic template families
 ✗ Training objective that uses invalid shape-validity examples directly
 ✗ Actual overnight/long-run synthetic quality result after increasing `MAX_STEPS`
+✗ Prediction-quality improvement from v7 middle_bridge routing over dense attention
+✗ Stable v7 block-level speedup across repeated seeds/runs
+✗ v7 generalization on harder held-out synthetic template families
 ```
 
 ---
@@ -684,7 +880,7 @@ Any benchmark that includes topology construction in every forward is measuring 
 
 The right claim is now:
 
-> Math routing can compile a large symbolic topology into a bounded top-K neighbor table, and the resulting Triton sparse attention path can beat dense attention. Cached sparse blocks can cross dense-block parity when K is small enough and topology structure is favorable.
+> Math routing can now compile a symbolic topology directly into a bounded fixed-K neighbor table. v7 adds middle-preserving bridge edges while keeping K fixed, the resulting cached Triton sparse block can cross dense-block parity at n=1024 trees, K=16, and a v7 K=16 trained checkpoint preserves full-attention route quality on the current synthetic validation split.
 
 The wrong claim would be:
 
@@ -696,7 +892,7 @@ It does not. With top-K truncation, runtime scales with `T*K`.
 
 ## Recommended Next Step
 
-The k-MIP selector comparison has now been run. The result is clear: topology-only is still the only selector that satisfies the speed objective, while k-MIP variants are currently too expensive.
+The k-MIP selector comparison has now been run, and v7 has added a better topology-only path. The result is clear: topology-only remains the only selector that satisfies the speed objective, while k-MIP variants are currently too expensive. The latest v7 K=16 checkpoint preserves full-attention route quality on the current synthetic validation split; the next question is harder generalization, not basic correctness.
 
 Current routing is topology-prior top-`K`:
 
@@ -729,24 +925,25 @@ Do not promote symbolic_candidate_kmip.
 
 Updated priority order:
 
-1. Expand the quality dataset beyond the 15-example tiny route task and rerun `Q(K)` for `topology_only`.
-2. Add harder held-out synthetic template families and rerun per-expert `Q(K)`.
-3. Run a true long synthetic training run with `MAX_STEPS` set explicitly.
-4. Run offline topology search against a held-out validation split, not the tiny train set.
-5. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
-6. Profile why the cached topology-only block still varies between winning and losing around dense parity.
-7. If k-MIP is revisited, make selection cheaper before benchmarking again:
+1. Add harder held-out synthetic template families and rerun `Q(K)` for `middle_preserving_topk` against `scored_topk` and full attention.
+2. Keep the current 6,068-example synthetic validation result as the v7 regression baseline: `Q_v7,K16 = Q_full = 1.0000`.
+3. Add harder held-out synthetic template families and rerun per-expert `Q(K)`.
+4. Run a true long synthetic training run with `MAX_STEPS` set explicitly.
+5. Run offline topology search against a held-out validation split, not the tiny train set.
+6. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
+7. Profile why the cached topology-only block still varies between winning and losing around dense parity.
+8. If k-MIP is revisited, make selection cheaper before benchmarking again:
    - fused candidate scoring/topK kernel,
    - approximate topK/indexed retrieval,
    - or precomputed learned candidate tables.
-8. Continue to measure both speed and quality:
+9. Continue to measure both speed and quality:
    - `S_a`: sparse Triton attention latency
    - `S_c`: cached sparse block latency
    - `D_b`: dense block latency
    - `Q(K)`: task quality
    - `Q(K) / Q_dense`
-9. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
-10. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
+10. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
+11. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
 
 Target acceptance condition:
 
@@ -755,6 +952,15 @@ For n=1024 trees:
   find selector mode and K such that:
     S_c < D_b
     Q(K) >= 0.95 * Q_dense
+
+For v7 middle_preserving_topk:
+  current synthetic validation gate is passed:
+    Q_v7(K=16) = 1.0000
+    Q_dense = 1.0000
+    dense_agree = 1.0000
+  next gate must be harder held-out templates:
+    Q_v7(K=16) >= 0.95 * Q_dense
+    middle_bridge edges remain selected under K=16
 
 For k-MIP variants:
   do not promote unless they beat or match topology_only quality
@@ -777,4 +983,271 @@ If topology_only loses quality but a k-MIP selector recovers it:
 
 If kmip_only matches symbolic_kmip:
   the symbolic topology is not adding enough value and should be simplified.
+```
+
+---
+
+## v8/v9 Prepared-Static Fast Path and Block-Token Triton Result
+
+The latest implementation separates three different concerns that were previously conflated in benchmark interpretation:
+
+```text
+symbolic topology construction  -> offline / cacheable
+prepared static topology lookup -> cheap hot-path metadata access
+Triton sparse attention kernel  -> real runtime bottleneck
+```
+
+### Prepared Static Block Benchmark
+
+The benchmark now exposes the prepared/static sparse block directly via:
+
+```bash
+scripts/benchmark_attention.sh \
+  --sizes 1024 \
+  --node-mode trees \
+  --topology-mode middle_preserving_topk \
+  --fixed-k 16 \
+  --max-neighbors 16 \
+  --middle-bridge-width 1 \
+  --profile-prepared-block
+```
+
+Observed prepared-static result:
+
+```text
+n=1024 trees, K=16
+allowed = 16,384
+full    = 1,048,576
+rel_red = 0.9844
+
+d_blk  = 2.398 ms
+s_c    = 2.017 ms
+p_blk  = 0.941 ms
+p_attn = 0.322 ms
+p_non  = 0.619 ms
+```
+
+Derived speedups:
+
+```text
+prepared vs dense block  = 2.398 / 0.941 = 2.55x
+prepared vs cached block = 2.017 / 0.941 = 2.14x
+cached vs dense block    = 2.398 / 2.017 = 1.19x
+```
+
+Interpretation:
+
+- The prepared/static sparse block crossed dense block parity decisively.
+- The old cached sparse block timing hid the real prepared-fast-path performance.
+- In the prepared profile, attention is no longer the majority of block time:
+
+```text
+p_attn / p_blk = 0.322 / 0.941 ≈ 34%
+p_non  / p_blk = 0.619 / 0.941 ≈ 66%
+```
+
+This means the next bottleneck shifted from topology to standard transformer overhead:
+
+```text
+LayerNorm + QKV + out_proj + FFN + residual/module overhead
+```
+
+### Inference Fast-Path Cleanup
+
+The block path now avoids several no-op dispatches in eval mode:
+
+```text
+eval dropout no-op bypass
+eval residual dropout no-op bypass
+eval FFN functional path
+```
+
+Direct profiler result after this cleanup:
+
+```text
+total_block_ms median ≈ 0.913 ms
+attention_kernel_ms   ≈ 0.326 ms
+```
+
+The cleanup is small but real. Pure Python/module-dispatch cleanup is now mostly exhausted.
+
+### Explicit Static Runtime API
+
+The model now exposes an explicit static inference API:
+
+```python
+model.prepare_static_topology(nodes, env, device=device)
+x = model.embed_nodes(nodes)
+out = model.forward_static_fast_path(x)
+```
+
+Also at block level:
+
+```python
+block.prepare_static_topology(nodes, env, device=device)
+out = block.forward_static_fast_path(x)
+```
+
+Correctness check:
+
+```text
+static fast path output == cached fast path output
+```
+
+CUDA microbenchmark:
+
+```text
+cached_fast_path median_ms = 0.627
+static_fast_path median_ms = 0.646
+speedup_static_vs_cached  = 0.971x
+```
+
+Interpretation:
+
+- The explicit API is correct and useful for static deployment boundaries.
+- It is not itself a latency win, because cache/topology lookup overhead was already negligible.
+
+### Fusion Attempts
+
+Two simple fusion attempts were implemented, validated, and left opt-in because they were slower on the tested CUDA path.
+
+#### Fused LayerNorm + QKV
+
+Added:
+
+```python
+triton_layernorm_qkv(...)
+NeighborSparseMathAttention.enable_fused_norm_qkv = False
+```
+
+Correctness:
+
+```text
+max_diff = 4.768e-07
+```
+
+Latency:
+
+```text
+default_static_fast_path median_ms = 0.647
+optin_fused_norm_qkv median_ms     = 0.838
+```
+
+Decision:
+
+```text
+correct, but slower -> opt-in only
+```
+
+#### Fused Sparse Attention + Output Projection
+
+Added:
+
+```python
+triton_neighbor_attention_outproj(...)
+NeighborSparseMathAttention.enable_fused_attn_outproj = False
+```
+
+Correctness:
+
+```text
+max_diff = 4.768e-07
+```
+
+Latency:
+
+```text
+default_static median_ms     = 0.861
+fused_attn_outproj median_ms = 0.882
+```
+
+Decision:
+
+```text
+correct, but slightly slower -> opt-in only
+```
+
+### Block-Token Triton Sparse Attention
+
+The successful kernel-level upgrade is block-token sparse attention:
+
+```python
+triton_neighbor_attention_flat_block_t(...)
+NeighborSparseMathAttention.enable_block_token_attention = True
+NeighborSparseMathAttention.block_token_attention_t = 2
+```
+
+This changes the CUDA sparse attention launch pattern from:
+
+```text
+one Triton program per (batch, head, token)
+```
+
+to:
+
+```text
+one Triton program per (batch, head, token-block)
+```
+
+with a default token block size:
+
+```text
+block_t = 2
+```
+
+Correctness:
+
+```text
+block_t=2 max_diff=0
+block_t=4 max_diff=0
+block_t=8 max_diff=0
+```
+
+Benchmark comparison:
+
+```text
+default_block_token_t2 median_ms = 0.605
+legacy_one_token median_ms       = 0.617
+speedup                         = 1.021x
+```
+
+Decision:
+
+```text
+block-token sparse attention is now the default CUDA sparse attention path
+legacy one-token kernel remains available via enable_block_token_attention=False
+```
+
+### Current Bottom Line
+
+The project has now crossed the important viability threshold:
+
+```text
+prepared static sparse block < dense block
+0.941 ms < 2.398 ms
+```
+
+The current best-known hot-path shape is:
+
+```text
+fixed-K symbolic topology, K=16
+prepared static topology buffers
+Triton sparse attention with block_t=2
+standard transformer FFN/LayerNorm/out_proj around it
+```
+
+The next major target is no longer symbolic routing. It is kernel specialization for the remaining transformer block overhead:
+
+```text
+attention_kernel_ms <= 0.22 ms
+total_block_ms <= 0.75 ms
+```
+
+Most likely next upgrades:
+
+```text
+specialize sparse attention for H=4,D=16,K=16,T=1024
+increase work per Triton program without register spilling
+fuse residual/writeback logic where profitable
+replace generic FFN path with inference-specialized kernels
 ```

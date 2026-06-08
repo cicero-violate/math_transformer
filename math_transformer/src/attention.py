@@ -52,9 +52,14 @@ class _AttentionBase(nn.Module):
             return proj(x).view(B, T, H, Dh).transpose(1, 2)
         return _p(self.q_proj), _p(self.k_proj), _p(self.v_proj)
 
+    def _maybe_dropout(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.dropout.p > 0.0:
+            return self.dropout(x)
+        return x
+
     def _collect(self, out: torch.Tensor, B: int, T: int) -> torch.Tensor:
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
-        return self.out_proj(self.dropout(out))
+        return self.out_proj(self._maybe_dropout(out))
 
     def _project_bhtd(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         H, Dh = self.n_heads, self.d_head
@@ -66,7 +71,7 @@ class _AttentionBase(nn.Module):
     def _collect_bhtd(self, out: torch.Tensor) -> torch.Tensor:
         H, Dh = self.n_heads, self.d_head
         w = self.out_proj.weight.view(self.d_model, H, Dh)
-        y = torch.einsum("bhtd,ohd->bto", self.dropout(out), w)
+        y = torch.einsum("bhtd,ohd->bto", self._maybe_dropout(out), w)
         if self.out_proj.bias is not None:
             y = y + self.out_proj.bias
         return y
@@ -121,10 +126,23 @@ class NeighborSparseMathAttention(_AttentionBase):
       valid     : (T, K) BoolTensor  — True = real neighbor, False = padding
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        triton_block_d: int | None = None,
+        triton_block_k: int | None = None,
+    ) -> None:
         super().__init__(d_model, n_heads, dropout)
         self._qkv_weight_cache: torch.Tensor | None = None
         self._qkv_weight_versions: tuple[int, int, int] | None = None
+        self.triton_block_d = triton_block_d
+        self.triton_block_k = triton_block_k
+        self.enable_fused_norm_qkv = False
+        self.enable_fused_attn_outproj = False
+        self.enable_block_token_attention = True
+        self.block_token_attention_t = 2
 
     def _fused_qkv_weight(self) -> torch.Tensor:
         if torch.is_grad_enabled() and self.training:
@@ -157,6 +175,64 @@ class NeighborSparseMathAttention(_AttentionBase):
         qkv = F.linear(x, self._fused_qkv_weight())
         q, k, v = qkv.view(B, T, 3, H, Dh).unbind(dim=2)
         return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+    def forward_fused_norm_qkv(
+        self,
+        x: torch.Tensor,
+        norm: nn.LayerNorm,
+        neighbors: torch.Tensor,
+        valid: torch.Tensor | None = None,
+        selector_mode: SparseSelectorMode = "topology_only",
+        symbolic_scores: torch.Tensor | None = None,
+        selector_alpha: float = 1.0,
+        selector_beta: float = 1.0,
+        selector_k: int | None = None,
+    ) -> torch.Tensor:
+        if (
+            not self.enable_fused_norm_qkv
+            or self.training
+            or selector_mode != "topology_only"
+            or not x.is_cuda
+        ):
+            return self(
+                norm(x), neighbors, valid,
+                selector_mode=selector_mode,
+                symbolic_scores=symbolic_scores,
+                selector_alpha=selector_alpha,
+                selector_beta=selector_beta,
+                selector_k=selector_k,
+            )
+        from .triton_attention import (
+            triton_layernorm_qkv,
+            triton_neighbor_attention_flat,
+            TRITON_AVAILABLE,
+        )
+        if not TRITON_AVAILABLE:
+            return self(
+                norm(x), neighbors, valid,
+                selector_mode=selector_mode,
+                symbolic_scores=symbolic_scores,
+                selector_alpha=selector_alpha,
+                selector_beta=selector_beta,
+                selector_k=selector_k,
+            )
+        q, k, v = triton_layernorm_qkv(
+            x, self._fused_qkv_weight(), norm.weight, norm.bias, norm.eps, self.n_heads
+        )
+        out = triton_neighbor_attention_flat(
+            q, k, v, neighbors, valid,
+            block_d=self.triton_block_d,
+            block_k=self.triton_block_k,
+        )
+        return self.out_proj(self._maybe_dropout(out))
+
+    def project_norm_qkv_for_profile(
+        self, x: torch.Tensor, norm: nn.LayerNorm
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from .triton_attention import triton_layernorm_qkv
+        return triton_layernorm_qkv(
+            x, self._fused_qkv_weight(), norm.weight, norm.bias, norm.eps, self.n_heads
+        )
 
     def forward(
         self,
@@ -205,8 +281,54 @@ class NeighborSparseMathAttention(_AttentionBase):
             out = neighbor_attention(q, k, v, neighbors, valid.bool() if valid is not None else valid)
             out = out.transpose(1, 2).reshape(B, T, self.d_model)
         else:
-            out = triton_neighbor_attention_flat(q, k, v, neighbors, valid)
-        return self.out_proj(self.dropout(out))
+            if self.enable_fused_attn_outproj and not self.training:
+                from .triton_attention import triton_neighbor_attention_outproj
+                return triton_neighbor_attention_outproj(
+                    q, k, v, neighbors, valid,
+                    self.out_proj.weight, self.out_proj.bias,
+                    block_d=self.triton_block_d,
+                    block_k=self.triton_block_k,
+                )
+            else:
+                if self.enable_block_token_attention:
+                    from .triton_attention import triton_neighbor_attention_flat_block_t
+                    out = triton_neighbor_attention_flat_block_t(
+                        q, k, v, neighbors, valid,
+                        block_t=self.block_token_attention_t,
+                        block_d=self.triton_block_d,
+                        block_k=self.triton_block_k,
+                    )
+                else:
+                    out = triton_neighbor_attention_flat(
+                        q, k, v, neighbors, valid,
+                        block_d=self.triton_block_d,
+                        block_k=self.triton_block_k,
+                    )
+        return self.out_proj(self._maybe_dropout(out))
+
+    def project_qkv_for_profile(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expose fused QKV projection for block-level profiling."""
+        return self._project_qkv_bhtd(x)
+
+    def out_project_for_profile(self, out: torch.Tensor) -> torch.Tensor:
+        """Expose output projection for block-level profiling."""
+        return self.out_proj(self._maybe_dropout(out))
+
+    def attention_out_project_for_profile(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        neighbors: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        from .triton_attention import triton_neighbor_attention_outproj
+        return triton_neighbor_attention_outproj(
+            q, k, v, neighbors, valid,
+            self.out_proj.weight, self.out_proj.bias,
+            block_d=self.triton_block_d,
+            block_k=self.triton_block_k,
+        )
 
 
 # ── Aliases / backwards compat ────────────────────────────────────────────────
