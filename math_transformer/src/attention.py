@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,6 +102,14 @@ class DenseMaskedMathAttention(_AttentionBase):
 
 # ── Neighbor-sparse attention ─────────────────────────────────────────────────
 
+SparseSelectorMode = Literal[
+    "topology_only",
+    "kmip_only",
+    "symbolic_kmip",
+    "symbolic_candidate_kmip",
+]
+
+
 class NeighborSparseMathAttention(_AttentionBase):
     """
     Multi-head attention that computes scores only for pre-selected neighbors.
@@ -154,14 +163,44 @@ class NeighborSparseMathAttention(_AttentionBase):
         x: torch.Tensor,
         neighbors: torch.Tensor,
         valid: torch.Tensor | None = None,
+        selector_mode: SparseSelectorMode = "topology_only",
+        symbolic_scores: torch.Tensor | None = None,
+        selector_alpha: float = 1.0,
+        selector_beta: float = 1.0,
+        selector_k: int | None = None,
     ) -> torch.Tensor:
         from .triton_attention import (
             triton_neighbor_attention_flat,
             TRITON_AVAILABLE,
         )
-        from .sparse_attention import neighbor_attention
+        from .sparse_attention import (
+            neighbor_attention,
+            neighbors_from_candidate_qk_scores,
+            neighbors_from_qk_scores,
+        )
         B, T, _ = x.shape
         q, k, v = self._project_qkv_bhtd(x)
+        if selector_mode != "topology_only":
+            final_k = selector_k if selector_k is not None else neighbors.shape[1]
+            if selector_mode == "symbolic_candidate_kmip":
+                neighbors, valid_bool = neighbors_from_candidate_qk_scores(
+                    q, k,
+                    candidate_neighbors=neighbors,
+                    candidate_valid=valid.bool() if valid is not None else None,
+                    max_k=final_k,
+                    symbolic_scores=symbolic_scores,
+                    alpha=selector_alpha,
+                    beta=selector_beta,
+                )
+            else:
+                neighbors, valid_bool = neighbors_from_qk_scores(
+                    q, k,
+                    max_k=final_k,
+                    symbolic_scores=symbolic_scores if selector_mode == "symbolic_kmip" else None,
+                    alpha=selector_alpha,
+                    beta=selector_beta,
+                )
+            valid = valid_bool.char() if x.is_cuda else valid_bool
         if (not TRITON_AVAILABLE) or (not x.is_cuda):
             out = neighbor_attention(q, k, v, neighbors, valid.bool() if valid is not None else valid)
             out = out.transpose(1, 2).reshape(B, T, self.d_model)

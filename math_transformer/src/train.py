@@ -47,7 +47,7 @@ def _make_model(cfg: dict) -> MathRoutedTransformer:
     )
 
 
-def train(config_path: str) -> None:
+def train(config_path: str, save_checkpoint: str | None = None) -> None:
     cfg = _load_config(config_path)
     tc = cfg["training"]
     ec = cfg["eval"]
@@ -92,13 +92,25 @@ def train(config_path: str) -> None:
             )
 
     print("Training complete.")
+    if save_checkpoint:
+        p = Path(save_checkpoint)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "config": cfg,
+            },
+            p,
+        )
+        print(f"Saved checkpoint to {p}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Math-Routed Transformer")
     parser.add_argument("--config", default="configs/tiny.yaml")
+    parser.add_argument("--save-checkpoint", default=None, dest="save_checkpoint")
     args = parser.parse_args()
-    train(args.config)
+    train(args.config, save_checkpoint=args.save_checkpoint)
 
 
 if __name__ == "__main__":

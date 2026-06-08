@@ -51,6 +51,10 @@ The hot path now includes these optimizations:
    - `symbolic_candidate_kmip`
 9. Benchmark reporting now includes selector-level attention time, cached block time, and dense-output proxy metrics.
 10. `stk_atn` now reports valid scored-topK attention timing instead of `0.000`.
+11. A route-quality evaluation path was added:
+    - `python -m src.eval --quality --quality-k 16,32,64,128`
+    - optional checkpoint loading through `--checkpoint`
+    - optional checkpoint saving during training through `python -m src.train --save-checkpoint ...`
 
 CUDA correctness status:
 
@@ -188,10 +192,10 @@ symbolic_candidate_kmip   = score only 64 cached symbolic candidates, then selec
 
 | selector                | attention | cached block | dense L1 proxy | dense cosine proxy |
 |-------------------------+-----------+--------------+----------------+--------------------|
-| topology_only           | 0.264 ms  | 4.319 ms     |       0.275798 |           0.092203 |
-| kmip_only               | 2.084 ms  | 5.907 ms     |       0.260597 |           0.350401 |
-| symbolic_kmip           | 2.300 ms  | 6.567 ms     |       0.268183 |           0.239802 |
-| symbolic_candidate_kmip | 3.591 ms  | 8.307 ms     |       0.266916 |           0.190543 |
+| topology_only           | 0.293 ms  | 3.886 ms     |       0.287590 |           0.151736 |
+| kmip_only               | 2.112 ms  | 5.939 ms     |       0.259210 |           0.339546 |
+| symbolic_kmip           | 2.354 ms  | 6.280 ms     |       0.268954 |           0.232432 |
+| symbolic_candidate_kmip | 3.590 ms  | 7.850 ms     |       0.273231 |           0.172479 |
 
 Roots interpretation:
 
@@ -204,20 +208,26 @@ Roots interpretation:
 
 | selector                | attention | cached block | dense L1 proxy | dense cosine proxy |
 |-------------------------+-----------+--------------+----------------+--------------------|
-| topology_only           | 0.299 ms  | 2.090 ms     |       0.286512 |           0.110257 |
-| kmip_only               | 2.129 ms  | 3.912 ms     |       0.262491 |           0.340259 |
-| symbolic_kmip           | 2.307 ms  | 4.366 ms     |       0.270157 |           0.195079 |
-| symbolic_candidate_kmip | 3.598 ms  | 5.784 ms     |       0.271243 |           0.175268 |
+| topology_only           | 0.273 ms  | 2.843 ms     |       0.284101 |           0.145990 |
+| kmip_only               | 2.109 ms  | 4.284 ms     |       0.260552 |           0.348350 |
+| symbolic_kmip           | 2.310 ms  | 4.295 ms     |       0.269202 |           0.206195 |
+| symbolic_candidate_kmip | 3.553 ms  | 5.855 ms     |       0.272172 |           0.185624 |
 
 Trees interpretation:
 
-- `topology_only` is the only selector that clearly beats dense block time in this run:
+- `topology_only` remains the fastest selector, but the latest run did not repeat the prior dense-block win:
+
+```text
+topology_only: s_c = 2.843 ms > d_blk = 2.343 ms
+```
+
+- The strongest large-tree block-level result remains the previous run:
 
 ```text
 topology_only: s_c = 2.090 ms < d_blk = 2.335 ms
 ```
 
-- This is now the strongest large-tree block-level result observed so far.
+- Block parity is therefore reachable but not stable yet.
 - `kmip_only` again has the best dense-output proxy but loses the block-level speed objective.
 - `symbolic_candidate_kmip` does not recover the expected performance benefit from candidate restriction. The likely cause is that its current PyTorch gather/scoring/topK path has more overhead than the full matrix score path at `T=1024, C=64`.
 - Dense-output proxy metrics are not task quality. They are useful smoke signals only; the architecture decision still requires `Q(K)` on actual tasks.
@@ -229,6 +239,76 @@ Do not promote k-MIP or symbolic candidate k-MIP yet.
 Keep topology_only as the default.
 Treat k-MIP selectors as experimental quality probes until selection is fused or otherwise made cheaper.
 ```
+
+---
+
+## Quality Evaluation Path
+
+The benchmark now has a separate quality mode for the route-prediction task:
+
+```bash
+python -m src.eval \
+  --quality \
+  --quality-k 16,32,64,128 \
+  --checkpoint runs/checkpoints/model.pt
+```
+
+This reports:
+
+```text
+mode=full           k=full  route_acc=...
+mode=topology_only  k=16    route_acc=...  dense_agree=...
+mode=topology_only  k=32    route_acc=...  dense_agree=...
+```
+
+Use `route_acc` as the first task-quality signal and `dense_agree` as a regression signal against the same model weights under full attention. If no checkpoint is provided, the command evaluates random initialization and is only a plumbing smoke test.
+
+Training can now emit a checkpoint for this path:
+
+```bash
+python -m src.train \
+  --config configs/tiny.yaml \
+  --save-checkpoint runs/checkpoints/tiny.pt
+```
+
+This does not prove final model quality yet. It creates the measurement path needed to compare `Q(K)` and `Q(K) / Q_dense` for topology-only sparse attention.
+
+### Tiny Route-Task Quality Result
+
+Run:
+
+```bash
+python -m src.train \
+  --config configs/tiny.yaml \
+  --save-checkpoint runs/checkpoints/tiny.pt
+
+python -m src.eval \
+  --quality \
+  --quality-k 16,32,64,128 \
+  --checkpoint runs/checkpoints/tiny.pt
+```
+
+Result:
+
+| mode | K | route accuracy | dense agreement |
+|------|--:|---------------:|----------------:|
+| full | full | 0.9333 | n/a |
+| topology_only | 16 | 0.9333 | 1.0000 |
+| topology_only | 32 | 0.9333 | 1.0000 |
+| topology_only | 64 | 0.9333 | 1.0000 |
+| topology_only | 128 | 0.9333 | 1.0000 |
+
+Quality interpretation:
+
+- On the tiny route-prediction task, topology-only sparse attention preserves the full-attention route decisions exactly for all tested K values.
+- `K=16` satisfies the current quality threshold on this task:
+
+```text
+Q(K=16) / Q_dense = 0.9333 / 0.9333 = 1.0
+```
+
+- This is a small-data smoke result, not a final quality claim. The route task has only 15 examples and the model is evaluated on the same examples used for the short training run.
+- The result is still important because it removes the first quality blocker: reducing runtime neighbors to K=16 did not degrade this trained route-task checkpoint.
 
 ---
 
@@ -272,8 +352,8 @@ At `n=1024`, topology construction remains far too expensive for a live forward 
 
 | mode  | topo_ms range in latest runs           |
 |-------+----------------------------------------|
-| roots | about 2.00s in the latest run          |
-| trees | about 1.08s to 1.10s in the latest run |
+| roots | about 2.00s to 2.30s in latest runs    |
+| trees | about 1.08s to 1.33s in latest runs    |
 
 The architecture must remain two-stage:
 
@@ -297,6 +377,8 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✓ Topology construction must be cached/offline
 ✓ scored_topK attention timing is now reported
 ✓ topology_only at K=16 can beat dense block at n=1024 trees
+✓ Route-quality evaluation can compare full attention against topology_only at multiple K values
+✓ On the tiny route task, topology_only preserves full-attention route accuracy at K=16..128
 ```
 
 ---
@@ -307,9 +389,10 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✗ Universal cached sparse block speedup
 ✗ Roots-mode block-level speedup at n=1024
 ✗ End-to-end training or inference speedup including all model infrastructure
-✗ Quality retention as K is reduced to 16 or 32
+✗ Quality retention as K is reduced to 16 or 32 on larger/non-tiny tasks
 ✗ k-MIP or symbolic k-MIP selector speedup
 ✗ Task-quality improvement from k-MIP selectors
+✗ Stable tree block-level speedup across repeated benchmark runs
 ```
 
 ---
@@ -363,7 +446,7 @@ Do not promote symbolic_candidate_kmip.
 
 Updated priority order:
 
-1. Measure real task quality for `topology_only` at `K=16`, `K=32`, `K=64`, and `K=128`.
+1. Expand the quality dataset beyond the 15-example tiny route task and rerun `Q(K)` for `topology_only`.
 2. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
 3. Profile why the cached topology-only block still varies between winning and losing around dense parity.
 4. If k-MIP is revisited, make selection cheaper before benchmarking again:

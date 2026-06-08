@@ -1,7 +1,14 @@
 import torch
 import pytest
 from src.attention import math_attention
-from src.sparse_attention import neighbors_from_mask, neighbor_attention, max_k_from_mask
+from src.sparse_attention import (
+    neighbors_from_mask,
+    neighbor_attention,
+    max_k_from_mask,
+    neighbors_from_candidate_qk_scores,
+    neighbors_from_qk_scores,
+    symbolic_priority_scores,
+)
 
 
 def _make_mask(T: int, density: float = 0.4) -> torch.Tensor:
@@ -151,6 +158,79 @@ def test_prioritized_keeps_high_priority_first():
         assert nb[i, 0].item() == i, f"Row {i}: expected self-index first, got {nb[i, 0].item()}"
 
 
+def test_neighbors_from_qk_scores_keeps_self_and_shape():
+    torch.manual_seed(10)
+    B, H, T, D = 1, 2, 5, 4
+    q = torch.randn(B, H, T, D)
+    k = torch.randn(B, H, T, D)
+
+    nb, valid = neighbors_from_qk_scores(q, k, max_k=3)
+
+    assert nb.shape == (T, 3)
+    assert valid.shape == (T, 3)
+    assert valid.all()
+    for i in range(T):
+        assert i in nb[i].tolist()
+
+
+def test_symbolic_kmip_bonus_changes_selection():
+    B, H, T, D = 1, 1, 4, 2
+    q = torch.zeros(B, H, T, D)
+    k = torch.zeros(B, H, T, D)
+    q[:, :, :, 0] = 1.0
+    k[:, :, :, 0] = 1.0
+
+    priority = torch.zeros(T, T, dtype=torch.int8)
+    priority.fill_diagonal_(1)
+    priority[0, 2] = 2
+    symbolic = symbolic_priority_scores(priority)
+
+    nb, valid = neighbors_from_qk_scores(
+        q, k, max_k=2,
+        symbolic_scores=symbolic,
+        alpha=0.0,
+        beta=1.0,
+    )
+
+    assert valid[0].all()
+    assert set(nb[0].tolist()) == {0, 2}
+
+
+def test_candidate_kmip_selects_only_from_candidates():
+    B, H, T, D = 1, 1, 5, 2
+    q = torch.zeros(B, H, T, D)
+    k = torch.zeros(B, H, T, D)
+    q[:, :, :, 0] = 1.0
+    k[:, :, :, 0] = 1.0
+
+    candidates = torch.tensor([
+        [0, 2, 4],
+        [1, 0, 3],
+        [2, 1, 4],
+        [3, 0, 2],
+        [4, 1, 3],
+    ])
+    valid = torch.ones_like(candidates, dtype=torch.bool)
+    symbolic = torch.zeros(T, T)
+    symbolic[0, 4] = 10.0
+    symbolic[0, 3] = 20.0  # Higher score, but not a row-0 candidate.
+
+    nb, vld = neighbors_from_candidate_qk_scores(
+        q, k,
+        candidate_neighbors=candidates,
+        candidate_valid=valid,
+        max_k=2,
+        symbolic_scores=symbolic,
+        alpha=0.0,
+        beta=1.0,
+    )
+
+    assert nb.shape == (T, 2)
+    assert vld.shape == (T, 2)
+    assert set(nb[0].tolist()) == {0, 4}
+    assert 3 not in nb[0].tolist()
+
+
 # ── Model block integration tests ─────────────────────────────────────────────
 
 def test_neighbor_sparse_in_model_block():
@@ -201,3 +281,30 @@ def test_neighbor_sparse_in_full_transformer():
 
     assert out.shape == (1, T, D)
     assert len(masks) == 2
+
+
+@pytest.mark.parametrize("selector", ["kmip_only", "symbolic_kmip", "symbolic_candidate_kmip"])
+def test_neighbor_sparse_selector_modes_in_model_block(selector):
+    from src.model import MathRoutedTransformerBlock
+    from src.parser import parse
+    from src.normalize import normalize
+
+    torch.manual_seed(11)
+    T, D = 8, 32
+    nodes = [normalize(parse("add(matmul(A, x), b)")) for _ in range(T)]
+    x = torch.randn(1, T, D)
+
+    block = MathRoutedTransformerBlock(
+        d_model=D, n_heads=4, d_ff=64, topk=2, local_window=1,
+        attention_mode="neighbor_sparse", max_neighbors=6,
+        sparse_selector=selector,
+        selector_k=4 if selector == "symbolic_candidate_kmip" else None,
+    )
+
+    with torch.no_grad():
+        out, mask, routes, diag = block(x, nodes)
+
+    assert out.shape == (1, T, D)
+    assert mask is not None
+    assert routes is not None
+    assert diag is not None

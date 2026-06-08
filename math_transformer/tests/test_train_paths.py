@@ -1,6 +1,7 @@
 import subprocess
 import sys
 from pathlib import Path
+import yaml
 
 PROJ = Path(__file__).parent.parent  # math_transformer/
 
@@ -42,3 +43,40 @@ def test_stable_fingerprint_across_processes():
         results.add(r.stdout.strip())
 
     assert len(results) == 1, f"Fingerprint differs across processes: {results}"
+
+
+def test_train_can_save_checkpoint(tmp_path):
+    from src.train import train
+
+    cfg = {
+        "model": {
+            "d_model": 16,
+            "n_heads": 2,
+            "n_layers": 1,
+            "d_ff": 32,
+            "dropout": 0.0,
+            "topk": 1,
+            "local_window": 1,
+        },
+        "training": {
+            "batch_size": 1,
+            "lr": 1.0e-3,
+            "max_steps": 1,
+            "warmup_steps": 0,
+        },
+        "data": {
+            "path": str(PROJ / "data" / "examples.jsonl"),
+            "max_seq_len": 32,
+        },
+        "eval": {
+            "interval": 1,
+            "metrics": ["route_accuracy"],
+        },
+    }
+    cfg_path = tmp_path / "tiny_train.yaml"
+    ckpt_path = tmp_path / "model.pt"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    train(str(cfg_path), save_checkpoint=str(ckpt_path))
+
+    assert ckpt_path.exists()

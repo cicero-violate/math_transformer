@@ -81,6 +81,7 @@ class BenchmarkReport:
     # Sprint 6 v6: scored top-K attention (avg_k ≈ fixed_k regardless of n)
     scored_topk_attn_ms: float = 0.0
     scored_topk_build_ms: float = 0.0
+    selector_results: dict[str, dict[str, float]] = field(default_factory=dict)
     # Sprint 6 v6: amortized cost (topology paid once, attention reused N times)
     amortized_cached_ms_10: float = 0.0
     amortized_cached_ms_100: float = 0.0
@@ -112,6 +113,17 @@ class BenchmarkReport:
             f"nbr_trunc={self.nbr_sparse_trunc_ms:.3f}ms  "
             f"compiled={self.compiled_sparse_attn_ms:.3f}ms  "
             f"triton={self.triton_sparse_attn_ms:.3f}ms",
+        ]
+        if self.selector_results:
+            lines.append("--- selector comparison ---")
+            for mode, vals in self.selector_results.items():
+                lines.append(
+                    f"  {mode}: attn={vals.get('attn_ms', 0.0):.3f}ms  "
+                    f"block={vals.get('cached_block_ms', 0.0):.3f}ms  "
+                    f"dense_proxy_l1={vals.get('dense_proxy_l1', 0.0):.6f}  "
+                    f"dense_proxy_cos={vals.get('dense_proxy_cos', 0.0):.6f}"
+                )
+        lines.extend([
             "--- block level ---",
             f"  full={self.full_block_ms:.3f}ms  "
             f"dense_masked={self.dense_masked_block_ms:.3f}ms  "
@@ -122,12 +134,29 @@ class BenchmarkReport:
             f"masked={self.masked_e2e_ms:.3f}ms  "
             f"sparse_uncached={self.sparse_e2e_uncached_ms:.3f}ms  "
             f"sparse_cached={self.sparse_e2e_cached_ms:.3f}ms",
-        ]
+        ])
         if self.by_relation:
             lines.append("--- relations ---")
             for rel, cnt in self.by_relation.items():
                 lines.append(f"  {rel}: {cnt}")
         return "\n".join(lines)
+
+
+@dataclass
+class QualityReport:
+    mode: str
+    k: int | None
+    n_examples: int
+    route_accuracy: float
+    dense_agreement: float | None = None
+
+    def __str__(self) -> str:
+        k_str = "full" if self.k is None else str(self.k)
+        agree = "" if self.dense_agreement is None else f"  dense_agree={self.dense_agreement:.4f}"
+        return (
+            f"mode={self.mode}  k={k_str}  examples={self.n_examples}  "
+            f"route_acc={self.route_accuracy:.4f}{agree}"
+        )
 
 
 # ── Node collection helpers ───────────────────────────────────────────────────
@@ -171,6 +200,33 @@ def _load_env_from_examples(examples_path: str | None) -> dict[str, tuple[int, .
     return {}
 
 
+def _load_route_eval_records(examples_path: str) -> list[dict]:
+    from .tasks import EXPERT_TO_ID
+
+    records: list[dict] = []
+    with open(examples_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            expert = rec.get("expert")
+            if expert not in EXPERT_TO_ID:
+                continue
+            raw_shape = rec.get("shape") or {}
+            env = {
+                k: tuple(v)
+                for k, v in raw_shape.items()
+                if k != "out" and isinstance(v, list)
+            }
+            records.append({
+                "expr": rec.get("normalized") or rec.get("expr", ""),
+                "expert_id": EXPERT_TO_ID[expert],
+                "env": env,
+            })
+    return records
+
+
 # ── Core benchmark ────────────────────────────────────────────────────────────
 
 def run_benchmark(
@@ -190,6 +246,9 @@ def run_benchmark(
     save_dir: str | None = None,
     topology_mode: str = "union",
     fixed_k: int = 32,
+    selector_alpha: float = 1.0,
+    selector_beta: float = 1.0,
+    selector_candidate_neighbors: int | None = None,
 ) -> BenchmarkReport:
     from .model import MathRoutedTransformer, MathRoutedTransformerBlock
     from .topology import TopologyBuilder
@@ -197,6 +256,8 @@ def run_benchmark(
     from .embedder import MathEmbedder
     from .sparse_attention import (
         neighbors_from_mask, neighbors_from_mask_prioritized, max_k_from_mask,
+        neighbors_from_candidate_qk_scores, neighbors_from_qk_scores,
+        symbolic_priority_scores,
     )
     from .topology import build_priority_matrix
     from .attention import math_attention
@@ -240,6 +301,10 @@ def run_benchmark(
     )
     exact_k = diag.max_k
     trunc_k = max_neighbors if max_neighbors is not None else max(exact_k // 2, 1)
+    candidate_k = selector_candidate_neighbors
+    if candidate_k is None:
+        candidate_k = min(max(trunc_k * 4, trunc_k), exact_k)
+    candidate_k = max(candidate_k, trunc_k, 1)
 
     # Sprint 1: time the full topology build pipeline (CPU path, cache-miss cost)
     _embedder_topo = MathEmbedder()
@@ -259,6 +324,7 @@ def run_benchmark(
 
     nb_exact, valid_exact = neighbors_from_mask_prioritized(mask_t, priority, exact_k)
     nb_trunc, valid_trunc = neighbors_from_mask_prioritized(mask_t, priority, trunc_k)
+    nb_candidate, valid_candidate = neighbors_from_mask_prioritized(mask_t, priority, candidate_k)
 
     # Move topology tensors to device
     mask_t    = mask_t.to(device)
@@ -266,6 +332,8 @@ def run_benchmark(
     valid_exact = valid_exact.to(device)
     nb_trunc  = nb_trunc.to(device)
     valid_trunc = valid_trunc.to(device)
+    nb_candidate = nb_candidate.to(device)
+    valid_candidate = valid_candidate.to(device)
 
     # ── Attention-only ────────────────────────────────────────────────────────
     B, H, Dh = 1, n_heads, d_model // n_heads
@@ -282,36 +350,84 @@ def run_benchmark(
     triton_ms = nbr_trunc_ms
 
     # v6 Sprint 1: scored top-K topology build + attention timing
-    from .topology import RELATION_WEIGHTS
     scored_topk_build_ms = 0.0
     scored_topk_attn_ms = 0.0
-    try:
-        _tb_stk = TopologyBuilder(
-            topk=topk, local_window=local_window,
-            topology_mode="scored_topk", fixed_k=fixed_k,
+    _tb_stk = TopologyBuilder(
+        topk=topk, local_window=local_window,
+        topology_mode="scored_topk", fixed_k=fixed_k,
+    )
+    _embedder_stk = MathEmbedder()
+
+    def _build_scored_topk_cpu():
+        _z = _embedder_stk.encode_batch(nodes)
+        _mask, _diag = _tb_stk.build_scored_topk(nodes, _z, env or None)
+        _mt = torch.tensor(_mask, dtype=torch.bool)
+        neighbors_from_mask(_mt, fixed_k)
+
+    scored_topk_build_ms = _timed(_build_scored_topk_cpu, n_warmup=1, n_iter=5)
+
+    # Build scored_topk neighbors for attention timing.
+    _z_stk = _embedder_stk.encode_batch(nodes)
+    _mask_stk, _diag_stk = _tb_stk.build_scored_topk(nodes, _z_stk, env or None)
+    _mask_stk_t = torch.tensor(_mask_stk, dtype=torch.bool)
+    _nb_stk, _valid_stk = neighbors_from_mask(_mask_stk_t, fixed_k)
+    _nb_stk = _nb_stk.to(device)
+    _valid_stk = _valid_stk.to(device)
+    scored_topk_attn_ms = _timed(
+        lambda: triton_neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
+        n_warmup, n_iter,
+    )
+
+    priority_t = torch.tensor(priority, dtype=torch.int8, device=device)
+    symbolic_scores_t = symbolic_priority_scores(priority_t)
+
+    def _attn_for_selector(selector: str) -> torch.Tensor:
+        if selector == "topology_only":
+            return triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc)
+        if selector == "kmip_only":
+            nb_sel, valid_sel = neighbors_from_qk_scores(q_, k_, trunc_k)
+        elif selector == "symbolic_kmip":
+            nb_sel, valid_sel = neighbors_from_qk_scores(
+                q_, k_, trunc_k,
+                symbolic_scores=symbolic_scores_t,
+                alpha=selector_alpha,
+                beta=selector_beta,
+            )
+        elif selector == "symbolic_candidate_kmip":
+            nb_sel, valid_sel = neighbors_from_candidate_qk_scores(
+                q_, k_,
+                candidate_neighbors=nb_candidate,
+                candidate_valid=valid_candidate,
+                max_k=trunc_k,
+                symbolic_scores=symbolic_scores_t,
+                alpha=selector_alpha,
+                beta=selector_beta,
+            )
+        else:
+            raise ValueError(f"unknown selector: {selector}")
+        return triton_neighbor_attention(q_, k_, v_, nb_sel, valid_sel)
+
+    with torch.no_grad():
+        dense_ref = math_attention(q_, k_, v_, None)
+
+    selector_results: dict[str, dict[str, float]] = {}
+    for selector in ("topology_only", "kmip_only", "symbolic_kmip", "symbolic_candidate_kmip"):
+        attn_ms = triton_ms if selector == "topology_only" else _timed(
+            lambda s=selector: _attn_for_selector(s), n_warmup, n_iter
         )
-        _embedder_stk = MathEmbedder()
-
-        def _build_scored_topk_cpu():
-            _z = _embedder_stk.encode_batch(nodes)
-            _mask, _diag = _tb_stk.build_scored_topk(nodes, _z, env or None)
-            _mt = torch.tensor(_mask, dtype=torch.bool)
-            _K = fixed_k
-            neighbors_from_mask_prioritized(_mt, priority, _K)
-
-        scored_topk_build_ms = _timed(_build_scored_topk_cpu, n_warmup=1, n_iter=5)
-
-        # Build scored_topk neighbors for attention timing
-        _z_stk = _embedder_stk.encode_batch(nodes)
-        _mask_stk, _diag_stk = _tb_stk.build_scored_topk(nodes, _z_stk, env or None)
-        _mask_stk_t = torch.tensor(_mask_stk, dtype=torch.bool).to(device)
-        _nb_stk, _valid_stk = neighbors_from_mask_prioritized(_mask_stk_t, priority, fixed_k)
-        scored_topk_attn_ms = _timed(
-            lambda: triton_neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
-            n_warmup, n_iter,
-        )
-    except Exception:
-        pass
+        with torch.no_grad():
+            out_sel = _attn_for_selector(selector)
+            dense_proxy_l1 = (out_sel - dense_ref).abs().mean().item()
+            dense_proxy_cos = torch.nn.functional.cosine_similarity(
+                out_sel.reshape(1, -1),
+                dense_ref.reshape(1, -1),
+                dim=1,
+            ).item()
+        selector_results[selector] = {
+            "attn_ms": float(attn_ms),
+            "dense_proxy_l1": float(dense_proxy_l1),
+            "dense_proxy_cos": float(dense_proxy_cos),
+        }
 
     # v6 Sprint 3: amortized topology cost (build once, reuse N times)
     # amortized_ms = (topo_build_ms + N * attention_ms) / N
@@ -353,6 +469,28 @@ def run_benchmark(
     dense_masked_block_ms = _timed(lambda: block_masked(x_dm, nodes, env=env or None), n_warmup, n_iter)
     sparse_uc_block_ms    = _timed(lambda: block_sparse_uc(x_dm, nodes, env=env or None), n_warmup, n_iter)
     sparse_c_block_ms     = _timed(lambda: block_sparse_c(x_dm, nodes, env=env or None, return_metadata=False), n_warmup, n_iter)
+    selector_results["topology_only"]["cached_block_ms"] = float(sparse_c_block_ms)
+
+    for selector in ("kmip_only", "symbolic_kmip", "symbolic_candidate_kmip"):
+        selector_cache = TopologyCache()
+        selector_cache_k = candidate_k if selector == "symbolic_candidate_kmip" else max_neighbors
+        block_selector = MathRoutedTransformerBlock(
+            d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            topk=topk, local_window=local_window, attention_mode="neighbor_sparse",
+            max_neighbors=selector_cache_k, topology_cache=selector_cache,
+            sparse_selector=selector,
+            selector_alpha=selector_alpha,
+            selector_beta=selector_beta,
+            selector_k=trunc_k if selector == "symbolic_candidate_kmip" else None,
+        ).to(device)
+        with torch.no_grad():
+            block_selector(x_dm, nodes, env=env or None, return_metadata=False)
+        selector_results[selector]["cached_block_ms"] = float(
+            _timed(
+                lambda b=block_selector: b(x_dm, nodes, env=env or None, return_metadata=False),
+                n_warmup, n_iter,
+            )
+        )
 
     # ── End-to-end ────────────────────────────────────────────────────────────
     verifier = Verifier()
@@ -405,6 +543,7 @@ def run_benchmark(
         triton_sparse_attn_ms=triton_ms,
         scored_topk_attn_ms=scored_topk_attn_ms,
         scored_topk_build_ms=scored_topk_build_ms,
+        selector_results=selector_results,
         amortized_cached_ms_10=amortized_cached_ms_10,
         amortized_cached_ms_100=amortized_cached_ms_100,
         full_block_ms=full_block_ms,
@@ -422,6 +561,99 @@ def run_benchmark(
         _save_report(report, save_dir)
 
     return report
+
+
+def run_quality_eval(
+    examples_path: str,
+    k_values: list[int],
+    d_model: int = 64,
+    n_heads: int = 4,
+    n_layers: int = 2,
+    d_ff: int = 128,
+    topk: int = 3,
+    local_window: int = 1,
+    checkpoint: str | None = None,
+    device: str | None = None,
+) -> list[QualityReport]:
+    from .model import MathRoutedTransformer
+    from .parser import parse
+    from .normalize import normalize
+
+    records = _load_route_eval_records(examples_path)
+    if not records:
+        raise ValueError(f"no route examples found in {examples_path}")
+
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch.manual_seed(0)
+    base_kwargs = dict(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_ff=d_ff,
+        dropout=0.0,
+        topk=topk,
+        local_window=local_window,
+    )
+    dense = MathRoutedTransformer(
+        **base_kwargs,
+        attention_mode="full",
+        share_topology_cache=False,
+    ).to(dev)
+
+    if checkpoint:
+        state = torch.load(checkpoint, map_location=dev)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        dense.load_state_dict(state)
+    dense.eval()
+    dense_state = dense.state_dict()
+
+    def _predictions(model: MathRoutedTransformer, pass_nodes: bool) -> list[int]:
+        preds: list[int] = []
+        model.eval()
+        with torch.no_grad():
+            for rec in records:
+                root = normalize(parse(rec["expr"]))
+                nodes = root.collect_nodes()
+                x = model.embed_nodes(nodes).to(dev)
+                out = model(x, nodes if pass_nodes else None, env=rec["env"] or None)[0]
+                logits = model.route_logits(out)
+                preds.append(int(logits.argmax(dim=-1).item()))
+        return preds
+
+    targets = [int(rec["expert_id"]) for rec in records]
+    dense_preds = _predictions(dense, pass_nodes=False)
+    reports = [
+        QualityReport(
+            mode="full",
+            k=None,
+            n_examples=len(records),
+            route_accuracy=op_accuracy(dense_preds, targets),
+            dense_agreement=None,
+        )
+    ]
+
+    for k in k_values:
+        sparse = MathRoutedTransformer(
+            **base_kwargs,
+            attention_mode="neighbor_sparse",
+            max_neighbors=k,
+            share_topology_cache=True,
+            sparse_selector="topology_only",
+        ).to(dev)
+        sparse.load_state_dict(dense_state)
+        sparse_preds = _predictions(sparse, pass_nodes=True)
+        reports.append(
+            QualityReport(
+                mode="topology_only",
+                k=k,
+                n_examples=len(records),
+                route_accuracy=op_accuracy(sparse_preds, targets),
+                dense_agreement=op_accuracy(sparse_preds, dense_preds),
+            )
+        )
+
+    return reports
 
 
 def _save_report(report: BenchmarkReport, save_dir: str) -> None:
@@ -486,6 +718,15 @@ def _print_row(r: BenchmarkReport) -> None:
     if r.by_relation:
         for rel, cnt in r.by_relation.items():
             print(f"         {rel}: {cnt}")
+    if r.selector_results:
+        for mode, vals in r.selector_results.items():
+            print(
+                f"         selector={mode} "
+                f"attn={vals.get('attn_ms', 0.0):.3f}ms "
+                f"block={vals.get('cached_block_ms', 0.0):.3f}ms "
+                f"dense_l1={vals.get('dense_proxy_l1', 0.0):.6f} "
+                f"dense_cos={vals.get('dense_proxy_cos', 0.0):.6f}"
+            )
 
 
 def _run_benchmark_cli(args: argparse.Namespace) -> None:
@@ -516,30 +757,68 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
                 save_dir=save_dir,
                 topology_mode=args.topology_mode,
                 fixed_k=args.fixed_k,
+                selector_alpha=args.selector_alpha,
+                selector_beta=args.selector_beta,
+                selector_candidate_neighbors=args.selector_candidate_neighbors,
             )
             _print_row(r)
+
+
+def _run_quality_cli(args: argparse.Namespace) -> None:
+    k_values = [int(x) for x in args.quality_k.split(",") if x.strip()]
+    reports = run_quality_eval(
+        examples_path=args.examples,
+        k_values=k_values,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        d_ff=args.d_ff,
+        topk=args.topk,
+        local_window=args.local_window,
+        checkpoint=args.checkpoint,
+        device=args.quality_device,
+    )
+    print(f"examples={args.examples}  checkpoint={args.checkpoint or 'random_init'}")
+    for report in reports:
+        print(report)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Eval / benchmark Math-Routed Transformer")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--quality", action="store_true")
     parser.add_argument("--sizes", default="8,16,32")
     parser.add_argument("--node-mode", default="roots,trees", dest="node_mode")
     parser.add_argument("--d-model", type=int, default=64, dest="d_model")
     parser.add_argument("--n-heads", type=int, default=4, dest="n_heads")
+    parser.add_argument("--n-layers", type=int, default=2, dest="n_layers")
+    parser.add_argument("--d-ff", type=int, default=128, dest="d_ff")
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
     parser.add_argument("--max-neighbors", type=int, default=DEFAULT_MAX_NEIGHBORS, dest="max_neighbors")
     parser.add_argument("--topology-mode", default="union", dest="topology_mode",
                         choices=["union", "scored_topk"])
     parser.add_argument("--fixed-k", type=int, default=32, dest="fixed_k")
+    parser.add_argument("--selector-alpha", type=float, default=1.0, dest="selector_alpha")
+    parser.add_argument("--selector-beta", type=float, default=1.0, dest="selector_beta")
+    parser.add_argument(
+        "--selector-candidate-neighbors",
+        type=int,
+        default=None,
+        dest="selector_candidate_neighbors",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--examples", default=None)
+    parser.add_argument("--examples", default="data/examples.jsonl")
+    parser.add_argument("--quality-k", default="16,32,64,128", dest="quality_k")
+    parser.add_argument("--quality-device", default=None, dest="quality_device")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--save-dir", default=None, dest="save_dir")
     args = parser.parse_args()
     if args.benchmark:
         _run_benchmark_cli(args)
+    if args.quality:
+        _run_quality_cli(args)
 
 
 if __name__ == "__main__":

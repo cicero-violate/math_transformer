@@ -9,7 +9,8 @@ from .ir import MathNode
 from .embedder import MathEmbedder, EMBED_DIM
 from .topology import TopologyBuilder, MaskDiagnostics
 from .topology_cache import TopologyCache, CachedTopology
-from .attention import DenseMaskedMathAttention, NeighborSparseMathAttention
+from .attention import DenseMaskedMathAttention, NeighborSparseMathAttention, SparseSelectorMode
+from .sparse_attention import symbolic_priority_scores
 from .router import OperatorRouter, RouteResult
 
 AttentionMode = Literal["full", "dense_masked", "neighbor_sparse"]
@@ -38,11 +39,19 @@ class MathRoutedTransformerBlock(nn.Module):
         topology_mode: str = "union",
         fixed_k: int = 32,
         relation_weights: dict | None = None,
+        sparse_selector: SparseSelectorMode = "topology_only",
+        selector_alpha: float = 1.0,
+        selector_beta: float = 1.0,
+        selector_k: int | None = None,
     ) -> None:
         super().__init__()
         self.attention_mode = attention_mode
         self.max_neighbors = max_neighbors
         self._topology_cache = topology_cache
+        self.sparse_selector = sparse_selector
+        self.selector_alpha = selector_alpha
+        self.selector_beta = selector_beta
+        self.selector_k = selector_k
 
         if attention_mode == "neighbor_sparse":
             self.attn = NeighborSparseMathAttention(d_model, n_heads, dropout)
@@ -79,7 +88,19 @@ class MathRoutedTransformerBlock(nn.Module):
         )
         nb = cached.neighbors.to(x.device)
         valid_i8 = cached.valid_i8.to(x.device)
-        x = x.add(self.drop(self.attn(self.norm1(x), nb, valid_i8)))
+        symbolic_scores = (
+            symbolic_priority_scores(torch.as_tensor(cached.priority, device=x.device))
+            if self.sparse_selector in ("symbolic_kmip", "symbolic_candidate_kmip")
+            else None
+        )
+        x = x.add(self.drop(self.attn(
+            self.norm1(x), nb, valid_i8,
+            selector_mode=self.sparse_selector,
+            symbolic_scores=symbolic_scores,
+            selector_alpha=self.selector_alpha,
+            selector_beta=self.selector_beta,
+            selector_k=self.selector_k,
+        )))
         return x.add(self.drop(self.ff(self.norm2(x))))
 
     def forward(
@@ -124,6 +145,11 @@ class MathRoutedTransformerBlock(nn.Module):
                 mask = cached.mask.to(x.device)
                 nb = cached.neighbors.to(x.device)
                 valid = cached.valid_i8.to(x.device)
+                symbolic_scores = (
+                    symbolic_priority_scores(torch.as_tensor(cached.priority, device=x.device))
+                    if self.sparse_selector in ("symbolic_kmip", "symbolic_candidate_kmip")
+                    else None
+                )
                 diag = cached.diagnostics
             else:
                 np_mask, diag = self.topology.build_detailed(nodes, z, env)
@@ -138,7 +164,14 @@ class MathRoutedTransformerBlock(nn.Module):
         x_normed = self.norm1(x)
 
         if self.attention_mode == "neighbor_sparse" and nodes is not None and len(nodes) == T:
-            attn_out = self.attn(x_normed, nb, valid)
+            attn_out = self.attn(
+                x_normed, nb, valid,
+                selector_mode=self.sparse_selector,
+                symbolic_scores=symbolic_scores,
+                selector_alpha=self.selector_alpha,
+                selector_beta=self.selector_beta,
+                selector_k=self.selector_k,
+            )
         elif self.attention_mode == "full":
             attn_out = self.attn(x_normed, mask=None)
         else:
@@ -166,6 +199,10 @@ class MathRoutedTransformer(nn.Module):
         topology_mode: str = "union",
         fixed_k: int = 32,
         relation_weights: dict | None = None,
+        sparse_selector: SparseSelectorMode = "topology_only",
+        selector_alpha: float = 1.0,
+        selector_beta: float = 1.0,
+        selector_k: int | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -182,6 +219,10 @@ class MathRoutedTransformer(nn.Module):
                 topology_mode=topology_mode,
                 fixed_k=fixed_k,
                 relation_weights=relation_weights,
+                sparse_selector=sparse_selector,
+                selector_alpha=selector_alpha,
+                selector_beta=selector_beta,
+                selector_k=selector_k,
             )
             for _ in range(n_layers)
         ])
