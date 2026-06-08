@@ -574,6 +574,9 @@ def run_quality_eval(
     local_window: int = 1,
     checkpoint: str | None = None,
     device: str | None = None,
+    topology_mode: str = "union",
+    fixed_k: int = 32,
+    relation_weights: dict[str, float] | None = None,
 ) -> list[QualityReport]:
     from .model import MathRoutedTransformer
     from .parser import parse
@@ -593,6 +596,9 @@ def run_quality_eval(
         dropout=0.0,
         topk=topk,
         local_window=local_window,
+        topology_mode=topology_mode,
+        fixed_k=fixed_k,
+        relation_weights=relation_weights,
     )
     dense = MathRoutedTransformer(
         **base_kwargs,
@@ -766,6 +772,9 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
 
 def _run_quality_cli(args: argparse.Namespace) -> None:
     k_values = [int(x) for x in args.quality_k.split(",") if x.strip()]
+    relation_weights = None
+    if args.relation_weights_json:
+        relation_weights = json.loads(Path(args.relation_weights_json).read_text())
     reports = run_quality_eval(
         examples_path=args.examples,
         k_values=k_values,
@@ -777,6 +786,9 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
         local_window=args.local_window,
         checkpoint=args.checkpoint,
         device=args.quality_device,
+        topology_mode=args.topology_mode,
+        fixed_k=args.fixed_k,
+        relation_weights=relation_weights,
     )
     print(f"examples={args.examples}  checkpoint={args.checkpoint or 'random_init'}")
     for report in reports:
@@ -813,6 +825,7 @@ def main() -> None:
     parser.add_argument("--quality-k", default="16,32,64,128", dest="quality_k")
     parser.add_argument("--quality-device", default=None, dest="quality_device")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--relation-weights-json", default=None, dest="relation_weights_json")
     parser.add_argument("--save-dir", default=None, dest="save_dir")
     args = parser.parse_args()
     if args.benchmark:

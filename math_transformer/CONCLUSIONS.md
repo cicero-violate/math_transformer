@@ -55,6 +55,10 @@ The hot path now includes these optimizations:
     - `python -m src.eval --quality --quality-k 16,32,64,128`
     - optional checkpoint loading through `--checkpoint`
     - optional checkpoint saving during training through `python -m src.train --save-checkpoint ...`
+12. An offline topology-search loop was added:
+    - `python -m src.topology_search --checkpoint ... --k 16 --iterations 100`
+    - optional unbounded mode through `--forever`
+    - writes the best accepted relation weights to JSON
 
 CUDA correctness status:
 
@@ -312,6 +316,72 @@ Q(K=16) / Q_dense = 0.9333 / 0.9333 = 1.0
 
 ---
 
+## Offline Topology Search
+
+Topology learning is implemented as an offline relation-weight search, not as live per-forward topology mutation.
+
+Run:
+
+```bash
+python -m src.topology_search \
+  --checkpoint runs/checkpoints/tiny.pt \
+  --k 16 \
+  --iterations 100 \
+  --output runs/topology_search/best_weights.json
+```
+
+For an open-ended run:
+
+```bash
+python -m src.topology_search \
+  --checkpoint runs/checkpoints/tiny.pt \
+  --k 16 \
+  --forever \
+  --output runs/topology_search/best_weights.json
+```
+
+The loop mutates scored-topK relation weights:
+
+```text
+symbolic_dependency
+composition
+shape_compat
+embedding
+local_window
+same_operator
+```
+
+`identity` is kept fixed so every node can always attend to itself.
+
+The search objective is:
+
+```text
+objective = quality_weight * route_accuracy
+          + (1 - quality_weight) * dense_agreement
+```
+
+Only candidates that match or improve the current objective are accepted and written to disk. The resulting JSON can be evaluated with:
+
+```bash
+python -m src.eval \
+  --quality \
+  --topology-mode scored_topk \
+  --fixed-k 16 \
+  --quality-k 16 \
+  --relation-weights-json runs/topology_search/best_weights.json \
+  --checkpoint runs/checkpoints/tiny.pt
+```
+
+This creates an auto-improving topology compiler loop:
+
+```text
+relation weights -> scored symbolic topology -> cached K-neighbor table -> sparse attention
+```
+
+The important constraint remains: inference should use the cached learned topology. The search loop can run for a long time offline, but only validated weight updates should be promoted.
+
+---
+
 ## Correct Scaling Interpretation
 
 The table should not be read as:
@@ -379,6 +449,7 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✓ topology_only at K=16 can beat dense block at n=1024 trees
 ✓ Route-quality evaluation can compare full attention against topology_only at multiple K values
 ✓ On the tiny route task, topology_only preserves full-attention route accuracy at K=16..128
+✓ Offline relation-weight search can improve topology policy without changing the live sparse kernel path
 ```
 
 ---
@@ -447,20 +518,21 @@ Do not promote symbolic_candidate_kmip.
 Updated priority order:
 
 1. Expand the quality dataset beyond the 15-example tiny route task and rerun `Q(K)` for `topology_only`.
-2. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
-3. Profile why the cached topology-only block still varies between winning and losing around dense parity.
-4. If k-MIP is revisited, make selection cheaper before benchmarking again:
+2. Run offline topology search against a held-out validation split, not the tiny train set.
+3. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
+4. Profile why the cached topology-only block still varies between winning and losing around dense parity.
+5. If k-MIP is revisited, make selection cheaper before benchmarking again:
    - fused candidate scoring/topK kernel,
    - approximate topK/indexed retrieval,
    - or precomputed learned candidate tables.
-5. Continue to measure both speed and quality:
+6. Continue to measure both speed and quality:
    - `S_a`: sparse Triton attention latency
    - `S_c`: cached sparse block latency
    - `D_b`: dense block latency
    - `Q(K)`: task quality
    - `Q(K) / Q_dense`
-6. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
-7. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
+7. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
+8. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
 
 Target acceptance condition:
 
