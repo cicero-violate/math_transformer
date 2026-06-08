@@ -115,7 +115,7 @@ max_k   = 343
 | 16  | 16,384  | 2.051 | 0.292 | 2.417 | 4.274 | sparse loses |
 | 32  | 32,768  | 1.973 | 0.326 | 2.691 | 4.306 | sparse loses |
 | 64  | 65,536  | 1.979 | 0.375 | 2.461 | 4.796 | sparse loses |
-| 128 | 131,072 | 1.992 | 0.608 | 2.533 | 5.308 | sparse loses |
+| 128 | 131,072 | 1.973 | 0.651 | 2.423 | 4.229 | sparse loses |
 
 Roots interpretation:
 
@@ -140,7 +140,7 @@ max_k   = 778
 | 16  | 16,384  | 1.973 | 0.289 | 2.467 | 2.241 | sparse wins |
 | 32  | 32,768  | 1.961 | 0.294 | 2.438 | 2.789 | sparse loses |
 | 64  | 65,536  | 2.003 | 0.432 | 2.403 | 3.296 | sparse loses |
-| 128 | 131,072 | 2.009 | 0.475 | 2.393 | 2.581 | sparse loses |
+| 128 | 131,072 | 1.954 | 0.475 | 2.466 | 2.418 | sparse wins |
 
 Trees interpretation:
 
@@ -150,9 +150,9 @@ Trees interpretation:
 s_c = 2.241 ms < d_blk = 2.467 ms
 ```
 
-- Increasing `K` increases kernel work and usually worsens block-level latency.
-- `K=32` has shown near-parity or slight wins in other runs, but the K-sweep shows it is not stable enough to claim a general block win.
-- For the current implementation, the practical operating point is likely `K=16` for large tree-shaped inputs.
+- Increasing `K` increases kernel work, but block latency is noisy because the surrounding block overhead dominates.
+- `K=128` now also crosses tree block parity in the latest rerun: `s_c = 2.418 ms < d_blk = 2.466 ms`.
+- `K=16` remains the fastest observed large-tree operating point, while `K=128` may be preferable if quality requires a larger neighbor budget.
 
 ---
 
@@ -263,6 +263,9 @@ Target acceptance condition:
 ```text
 For n=1024 trees, K=16:
   maintain quality while keeping s_c < d_blk
+
+For n=1024 trees, K=128:
+  evaluate whether the larger neighbor budget improves quality while preserving the latest block-level win
 
 For roots:
   identify and remove the block overhead that keeps s_c > d_blk even when K is small
