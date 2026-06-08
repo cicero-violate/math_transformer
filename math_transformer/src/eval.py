@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .model import DEFAULT_MAX_NEIGHBORS
+
 
 # ── Timing helpers ────────────────────────────────────────────────────────────
 
@@ -180,7 +182,7 @@ def run_benchmark(
     d_ff: int = 128,
     topk: int = 3,
     local_window: int = 1,
-    max_neighbors: int | None = None,
+    max_neighbors: int | None = DEFAULT_MAX_NEIGHBORS,
     n_warmup: int = 2,
     n_iter: int = 10,
     exprs: list[str] | None = None,
@@ -527,7 +529,7 @@ def main() -> None:
     parser.add_argument("--n-heads", type=int, default=4, dest="n_heads")
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
-    parser.add_argument("--max-neighbors", type=int, default=32, dest="max_neighbors")
+    parser.add_argument("--max-neighbors", type=int, default=DEFAULT_MAX_NEIGHBORS, dest="max_neighbors")
     parser.add_argument("--topology-mode", default="union", dest="topology_mode",
                         choices=["union", "scored_topk"])
     parser.add_argument("--fixed-k", type=int, default=32, dest="fixed_k")

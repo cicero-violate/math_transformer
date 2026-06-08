@@ -13,6 +13,7 @@ from .attention import DenseMaskedMathAttention, NeighborSparseMathAttention
 from .router import OperatorRouter, RouteResult
 
 AttentionMode = Literal["full", "dense_masked", "neighbor_sparse"]
+DEFAULT_MAX_NEIGHBORS = 16
 
 
 class MathRoutedTransformerBlock(nn.Module):
@@ -32,7 +33,7 @@ class MathRoutedTransformerBlock(nn.Module):
         topk: int = 4,
         local_window: int = 2,
         attention_mode: AttentionMode = "dense_masked",
-        max_neighbors: int | None = None,
+        max_neighbors: int | None = DEFAULT_MAX_NEIGHBORS,
         topology_cache: TopologyCache | None = None,
         topology_mode: str = "union",
         fixed_k: int = 32,
@@ -160,7 +161,7 @@ class MathRoutedTransformer(nn.Module):
         local_window: int = 2,
         n_experts: int = 7,
         attention_mode: AttentionMode = "dense_masked",
-        max_neighbors: int | None = None,
+        max_neighbors: int | None = DEFAULT_MAX_NEIGHBORS,
         share_topology_cache: bool = True,
         topology_mode: str = "union",
         fixed_k: int = 32,

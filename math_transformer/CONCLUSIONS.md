@@ -43,6 +43,7 @@ The hot path now includes these optimizations:
 4. Sparse attention uses a fused QKV projection cache for inference.
 5. A flat-output Triton sparse attention wrapper was added so sparse output can feed `out_proj` directly.
 6. A CUDA correctness test was added for the flat-output Triton wrapper.
+7. The default sparse neighbor budget is now `DEFAULT_MAX_NEIGHBORS = 16`, matching the best large-tree benchmark operating point. Passing `max_neighbors=None` still requests exact/unbounded `diag.max_k` behavior.
 
 CUDA correctness status:
 
@@ -253,7 +254,7 @@ It does not. With top-K truncation, runtime scales with `T*K`.
 The next work item is quality/performance co-design around `K`:
 
 1. Evaluate task quality at `K=16`, `K=32`, `K=64`, and `K=128`.
-2. Keep `K=16` as the current large-tree performance baseline.
+2. Keep `K=16` as the current large-tree performance baseline and source default.
 3. Profile `s_c` into projection, Triton attention, output projection, FFN, LayerNorm, and Python dispatch.
 4. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
 
