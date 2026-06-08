@@ -80,3 +80,109 @@ def test_train_can_save_checkpoint(tmp_path):
     train(str(cfg_path), save_checkpoint=str(ckpt_path))
 
     assert ckpt_path.exists()
+
+
+def test_train_accepts_data_path_override(tmp_path):
+    from src.synthetic_data import generate_splits
+    from src.train import train
+
+    generate_splits(
+        tmp_path / "synthetic",
+        train=4,
+        val=0,
+        test=0,
+        seed=5,
+        route_fraction=1.0,
+    )
+    cfg = {
+        "model": {
+            "d_model": 16,
+            "n_heads": 2,
+            "n_layers": 1,
+            "d_ff": 32,
+            "dropout": 0.0,
+            "topk": 1,
+            "local_window": 1,
+        },
+        "training": {
+            "batch_size": 1,
+            "lr": 1.0e-3,
+            "max_steps": 1,
+            "warmup_steps": 0,
+        },
+        "data": {
+            "path": "data/examples.jsonl",
+            "max_seq_len": 32,
+        },
+        "eval": {
+            "interval": 1,
+            "metrics": ["route_accuracy"],
+        },
+    }
+    cfg_path = tmp_path / "tiny_train.yaml"
+    ckpt_path = tmp_path / "synthetic.pt"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    train(
+        str(cfg_path),
+        save_checkpoint=str(ckpt_path),
+        data_path_override=str(tmp_path / "synthetic" / "train.jsonl"),
+    )
+
+    assert ckpt_path.exists()
+
+
+def test_train_accepts_step_overrides(tmp_path):
+    from src.synthetic_data import generate_splits
+    from src.train import train
+
+    generate_splits(
+        tmp_path / "synthetic",
+        train=4,
+        val=0,
+        test=0,
+        seed=8,
+        route_fraction=1.0,
+    )
+    cfg = {
+        "model": {
+            "d_model": 16,
+            "n_heads": 2,
+            "n_layers": 1,
+            "d_ff": 32,
+            "dropout": 0.0,
+            "topk": 1,
+            "local_window": 1,
+        },
+        "training": {
+            "batch_size": 1,
+            "lr": 1.0e-3,
+            "max_steps": 100,
+            "warmup_steps": 0,
+        },
+        "data": {
+            "path": "data/examples.jsonl",
+            "max_seq_len": 32,
+        },
+        "eval": {
+            "interval": 10,
+            "metrics": ["route_accuracy"],
+        },
+    }
+    cfg_path = tmp_path / "override_train.yaml"
+    ckpt_path = tmp_path / "override.pt"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+    train(
+        str(cfg_path),
+        save_checkpoint=str(ckpt_path),
+        data_path_override=str(tmp_path / "synthetic" / "train.jsonl"),
+        max_steps_override=2,
+        eval_interval_override=1,
+    )
+
+    import torch
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    assert state["config"]["training"]["max_steps"] == 2
+    assert state["config"]["eval"]["interval"] == 1

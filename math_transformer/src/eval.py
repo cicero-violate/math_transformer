@@ -149,14 +149,22 @@ class QualityReport:
     n_examples: int
     route_accuracy: float
     dense_agreement: float | None = None
+    by_expert: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
     def __str__(self) -> str:
         k_str = "full" if self.k is None else str(self.k)
         agree = "" if self.dense_agreement is None else f"  dense_agree={self.dense_agreement:.4f}"
-        return (
+        line = (
             f"mode={self.mode}  k={k_str}  examples={self.n_examples}  "
             f"route_acc={self.route_accuracy:.4f}{agree}"
         )
+        if not self.by_expert:
+            return line
+        details = "  ".join(
+            f"{expert}={stats['correct']}/{stats['total']}({stats['accuracy']:.4f})"
+            for expert, stats in sorted(self.by_expert.items())
+        )
+        return f"{line}\n         by_expert {details}"
 
 
 # ── Node collection helpers ───────────────────────────────────────────────────
@@ -222,6 +230,7 @@ def _load_route_eval_records(examples_path: str) -> list[dict]:
             records.append({
                 "expr": rec.get("normalized") or rec.get("expr", ""),
                 "expert_id": EXPERT_TO_ID[expert],
+                "expert": expert,
                 "env": env,
             })
     return records
@@ -628,6 +637,21 @@ def run_quality_eval(
         return preds
 
     targets = [int(rec["expert_id"]) for rec in records]
+    expert_names = [str(rec["expert"]) for rec in records]
+
+    def _by_expert(preds: list[int]) -> dict[str, dict[str, float | int]]:
+        stats: dict[str, dict[str, float | int]] = {}
+        for pred, target, expert in zip(preds, targets, expert_names):
+            entry = stats.setdefault(expert, {"correct": 0, "total": 0, "accuracy": 0.0})
+            entry["total"] = int(entry["total"]) + 1
+            if pred == target:
+                entry["correct"] = int(entry["correct"]) + 1
+        for entry in stats.values():
+            total = int(entry["total"])
+            correct = int(entry["correct"])
+            entry["accuracy"] = correct / total if total else 0.0
+        return stats
+
     dense_preds = _predictions(dense, pass_nodes=False)
     reports = [
         QualityReport(
@@ -636,6 +660,7 @@ def run_quality_eval(
             n_examples=len(records),
             route_accuracy=op_accuracy(dense_preds, targets),
             dense_agreement=None,
+            by_expert=_by_expert(dense_preds),
         )
     ]
 
@@ -656,6 +681,7 @@ def run_quality_eval(
                 n_examples=len(records),
                 route_accuracy=op_accuracy(sparse_preds, targets),
                 dense_agreement=op_accuracy(sparse_preds, dense_preds),
+                by_expert=_by_expert(sparse_preds),
             )
         )
 

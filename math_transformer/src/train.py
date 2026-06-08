@@ -47,11 +47,25 @@ def _make_model(cfg: dict) -> MathRoutedTransformer:
     )
 
 
-def train(config_path: str, save_checkpoint: str | None = None) -> None:
+def train(
+    config_path: str,
+    save_checkpoint: str | None = None,
+    data_path_override: str | None = None,
+    max_steps_override: int | None = None,
+    eval_interval_override: int | None = None,
+) -> None:
     cfg = _load_config(config_path)
     tc = cfg["training"]
     ec = cfg["eval"]
-    data_path = resolve_data_path(config_path, cfg["data"]["path"])
+    if max_steps_override is not None:
+        tc["max_steps"] = max_steps_override
+    if eval_interval_override is not None:
+        ec["interval"] = eval_interval_override
+    data_path = (
+        Path(data_path_override)
+        if data_path_override
+        else resolve_data_path(config_path, cfg["data"]["path"])
+    )
 
     route_examples = load_route_examples(data_path)
     device = torch.device("cpu")
@@ -109,8 +123,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train Math-Routed Transformer")
     parser.add_argument("--config", default="configs/tiny.yaml")
     parser.add_argument("--save-checkpoint", default=None, dest="save_checkpoint")
+    parser.add_argument("--data", default=None, dest="data_path_override")
+    parser.add_argument("--max-steps", type=int, default=None, dest="max_steps_override")
+    parser.add_argument("--eval-interval", type=int, default=None, dest="eval_interval_override")
     args = parser.parse_args()
-    train(args.config, save_checkpoint=args.save_checkpoint)
+    train(
+        args.config,
+        save_checkpoint=args.save_checkpoint,
+        data_path_override=args.data_path_override,
+        max_steps_override=args.max_steps_override,
+        eval_interval_override=args.eval_interval_override,
+    )
 
 
 if __name__ == "__main__":

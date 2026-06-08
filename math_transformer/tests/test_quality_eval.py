@@ -12,6 +12,7 @@ def test_load_route_eval_records_extracts_env():
     assert records
     assert records[0]["expr"] == "add(matmul(A,x),b)"
     assert records[0]["expert_id"] >= 0
+    assert records[0]["expert"] == "affine_expert"
     assert records[0]["env"]["A"] == (32, 64)
     assert "out" not in records[0]["env"]
 
@@ -34,3 +35,6 @@ def test_run_quality_eval_reports_full_and_sparse_k_values():
     assert all(0.0 <= r.route_accuracy <= 1.0 for r in reports)
     assert reports[0].dense_agreement is None
     assert all(0.0 <= r.dense_agreement <= 1.0 for r in reports[1:])
+    assert reports[0].by_expert
+    assert all("accuracy" in stats for stats in reports[0].by_expert.values())
+    assert "by_expert" in str(reports[0])

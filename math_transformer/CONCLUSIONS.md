@@ -59,6 +59,19 @@ The hot path now includes these optimizations:
     - `python -m src.topology_search --checkpoint ... --k 16 --iterations 100`
     - optional unbounded mode through `--forever`
     - writes the best accepted relation weights to JSON
+13. A deterministic synthetic-data generator was added:
+    - `python -m src.synthetic_data --out-dir data/synthetic --train 10000 --val 1000 --test 1000 --seed 0`
+    - emits mixed route and shape-validity JSONL records
+    - writes a manifest with split counts
+14. A one-command synthetic run script was added:
+    - `scripts/train_synthetic.sh`
+    - generates data, trains, then runs quality eval
+    - accepts `TRAIN`, `VAL`, `TEST`, `SEED`, `MAX_STEPS`, `EVAL_INTERVAL`, `CHECKPOINT`, and related overrides
+15. Quality reports now include per-expert accuracy diagnostics.
+16. Training now accepts CLI overrides:
+    - `--data`
+    - `--max-steps`
+    - `--eval-interval`
 
 CUDA correctness status:
 
@@ -382,6 +395,199 @@ The important constraint remains: inference should use the cached learned topolo
 
 ---
 
+## Synthetic Data and Per-Expert Quality
+
+The project now has a deterministic synthetic-data path for expanding beyond the 15-example hand-written route task.
+
+Primary command:
+
+```bash
+scripts/train_synthetic.sh
+```
+
+Equivalent manual stages:
+
+```bash
+python -m src.synthetic_data \
+  --out-dir data/synthetic \
+  --train 10000 \
+  --val 1000 \
+  --test 1000 \
+  --seed 0
+
+python -m src.train \
+  --config configs/tiny.yaml \
+  --data data/synthetic/train.jsonl \
+  --save-checkpoint runs/checkpoints/synthetic_tiny.pt
+
+python -m src.eval \
+  --quality \
+  --quality-k 16,32,64,128 \
+  --examples data/synthetic/val.jsonl \
+  --checkpoint runs/checkpoints/synthetic_tiny.pt
+```
+
+The synthetic generator emits two record types in the same JSONL stream:
+
+```text
+route records          -> consumed by route training and quality eval
+shape_validity records -> consumed by shape-validity loading/tests
+```
+
+Route records carry an `expert` label. Shape-validity records may be valid or invalid and use the `valid` flag. The route loader skips non-route records, so invalid shape examples do not poison route training.
+
+### 10k/1k/1k Synthetic Result
+
+Run:
+
+```bash
+scripts/train_synthetic.sh
+```
+
+Data:
+
+```text
+train records = 10,000
+train route records = 6,050
+train shape records = 3,950
+train invalid shape records = 1,597
+val route records = 599
+```
+
+Quality:
+
+```text
+full route_acc = 0.8331
+topology_only K=16 route_acc = 0.8331
+topology_only K=16 dense_agree = 1.0000
+```
+
+Per-expert result:
+
+```text
+affine_expert     102/102
+constraint_expert  99/99
+generic_expert     97/97
+grad_expert         0/100
+matmul_expert     108/108
+reduction_expert   93/93
+```
+
+Interpretation:
+
+- The model solved five of six generated route classes after a short 100-step run.
+- `grad_expert` was the only failure class in this seed/configuration.
+- `topology_only` exactly preserved the full-attention decisions at `K=16..128`.
+- This is a useful diagnostic result, not a final architecture claim.
+
+### 50k/5k/5k Synthetic Result
+
+Run:
+
+```bash
+TRAIN=50000 VAL=5000 TEST=5000 SEED=1 \
+CHECKPOINT=runs/checkpoints/synthetic_big.pt \
+scripts/train_synthetic.sh
+```
+
+Data:
+
+```text
+train records = 50,000
+train route records = 30,065
+val route records = 2,993
+```
+
+Quality:
+
+```text
+full route_acc = 1.0000
+topology_only K=16 route_acc = 1.0000
+topology_only K=16 dense_agree = 1.0000
+```
+
+Per-expert result:
+
+```text
+affine_expert     503/503
+constraint_expert 499/499
+generic_expert    521/521
+grad_expert       480/480
+matmul_expert     482/482
+reduction_expert  508/508
+```
+
+Interpretation:
+
+- The generated route grammar is learnable.
+- The current synthetic validation distribution can be saturated.
+- `topology_only` at `K=16` is behavior-preserving on this distribution.
+- The task is now too easy to prove broad generalization.
+
+### 200k/10k/10k Run Correction
+
+The attempted overnight command generated a large dataset:
+
+```text
+train records = 200,000
+train route records = 120,105
+val route records = 6,068
+```
+
+But training still stopped after 100 steps because `configs/synthetic_overnight.yaml` had:
+
+```yaml
+training:
+  max_steps: 100
+```
+
+The result:
+
+```text
+full route_acc = 0.8312
+constraint_expert = 0/1024
+all other experts = 1.0000
+```
+
+does not mean the large synthetic dataset failed. It means the run was still a short 100-step training run and did not settle the constraint class for that seed.
+
+The script now exposes training length directly:
+
+```bash
+TRAIN=200000 VAL=10000 TEST=10000 SEED=2 \
+MAX_STEPS=20000 EVAL_INTERVAL=1000 \
+CHECKPOINT=runs/checkpoints/synthetic_overnight.pt \
+scripts/train_synthetic.sh
+```
+
+Use this form for actual overnight runs.
+
+### Synthetic Data Verdict
+
+The synthetic-data path is now useful for plumbing, class diagnostics, and topology quality regression. It is not yet sufficient as the final task benchmark.
+
+The next quality upgrade should add harder held-out template families:
+
+1. deeper nested expressions,
+2. held-out gradient forms,
+3. constraint variants not seen in training,
+4. mixed affine/elementwise forms,
+5. topology stress examples that vary dependency, composition, local-window, same-operator, and shape-compatibility relations.
+
+The milestone should move from:
+
+```text
+high validation accuracy on generated templates
+```
+
+to:
+
+```text
+high validation accuracy on held-out template families
+```
+
+---
+
 ## Correct Scaling Interpretation
 
 The table should not be read as:
@@ -450,6 +656,9 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✓ Route-quality evaluation can compare full attention against topology_only at multiple K values
 ✓ On the tiny route task, topology_only preserves full-attention route accuracy at K=16..128
 ✓ Offline relation-weight search can improve topology policy without changing the live sparse kernel path
+✓ Synthetic route/shape data generation works and is deterministic
+✓ Per-expert quality diagnostics identify class-specific failures
+✓ topology_only at K=16 preserves full-attention decisions on current synthetic route validation
 ```
 
 ---
@@ -464,6 +673,9 @@ Any benchmark that includes topology construction in every forward is measuring 
 ✗ k-MIP or symbolic k-MIP selector speedup
 ✗ Task-quality improvement from k-MIP selectors
 ✗ Stable tree block-level speedup across repeated benchmark runs
+✗ Generalization to held-out synthetic template families
+✗ Training objective that uses invalid shape-validity examples directly
+✗ Actual overnight/long-run synthetic quality result after increasing `MAX_STEPS`
 ```
 
 ---
@@ -518,21 +730,23 @@ Do not promote symbolic_candidate_kmip.
 Updated priority order:
 
 1. Expand the quality dataset beyond the 15-example tiny route task and rerun `Q(K)` for `topology_only`.
-2. Run offline topology search against a held-out validation split, not the tiny train set.
-3. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
-4. Profile why the cached topology-only block still varies between winning and losing around dense parity.
-5. If k-MIP is revisited, make selection cheaper before benchmarking again:
+2. Add harder held-out synthetic template families and rerun per-expert `Q(K)`.
+3. Run a true long synthetic training run with `MAX_STEPS` set explicitly.
+4. Run offline topology search against a held-out validation split, not the tiny train set.
+5. Use `trees` as the primary block-parity target and `roots` as the overhead stress test.
+6. Profile why the cached topology-only block still varies between winning and losing around dense parity.
+7. If k-MIP is revisited, make selection cheaper before benchmarking again:
    - fused candidate scoring/topK kernel,
    - approximate topK/indexed retrieval,
    - or precomputed learned candidate tables.
-6. Continue to measure both speed and quality:
+8. Continue to measure both speed and quality:
    - `S_a`: sparse Triton attention latency
    - `S_c`: cached sparse block latency
    - `D_b`: dense block latency
    - `Q(K)`: task quality
    - `Q(K) / Q_dense`
-7. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
-8. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
+9. Keep `K=16` as the current source default until quality data proves a larger `K` is necessary.
+10. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
 
 Target acceptance condition:
 

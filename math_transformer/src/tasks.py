@@ -76,13 +76,14 @@ def load_shape_examples(path: str | Path) -> list[ShapeExample]:
             if "shape" not in d or not isinstance(d["shape"], dict):
                 continue
             expr = d.get("normalized") or d.get("expr", "")
-            shape_dict = d["shape"]
-            out_shape = tuple(shape_dict.pop("out", [])) or None
+            shape_dict = dict(d["shape"])
+            out_raw = shape_dict.pop("out", None)
+            out_shape = tuple(out_raw) if out_raw else None
             env = {k: tuple(v) for k, v in shape_dict.items()}
             examples.append(ShapeExample(
                 expr=expr,
                 env=env,
-                valid=True,  # examples.jsonl only has valid examples
+                valid=bool(d.get("valid", True)),
                 output_shape=out_shape,
             ))
     return examples
