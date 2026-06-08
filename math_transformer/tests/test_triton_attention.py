@@ -5,7 +5,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from src.triton_attention import triton_neighbor_attention, TRITON_AVAILABLE
+from src.triton_attention import triton_neighbor_attention, triton_neighbor_attention_flat, TRITON_AVAILABLE
 from src.sparse_attention import neighbor_attention
 
 
@@ -95,6 +95,20 @@ def test_triton_output_shape():
     neighbors, valid = _make_uniform_neighbors(T, K, DEVICE)
     out = triton_neighbor_attention(q, k, v, neighbors, valid)
     assert out.shape == (B, H, T, D)
+
+
+def test_triton_flat_matches_bhtd_wrapper():
+    B, H, T, D, K = 2, 4, 16, 32, 8
+    torch.manual_seed(11)
+    q = torch.randn(B, H, T, D, device=DEVICE)
+    k = torch.randn(B, H, T, D, device=DEVICE)
+    v = torch.randn(B, H, T, D, device=DEVICE)
+    neighbors, valid = _make_uniform_neighbors(T, K, DEVICE)
+    out_bhtd = triton_neighbor_attention(q, k, v, neighbors, valid)
+    out_flat = triton_neighbor_attention_flat(q, k, v, neighbors, valid.char())
+    expected = out_bhtd.transpose(1, 2).reshape(B, T, H * D)
+    assert out_flat.shape == expected.shape
+    assert torch.allclose(out_flat, expected, atol=1e-4, rtol=1e-4)
 
 
 def test_triton_all_invalid_row_gives_zero():

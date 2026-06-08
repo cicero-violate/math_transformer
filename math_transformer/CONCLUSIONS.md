@@ -1,213 +1,223 @@
 # Conclusions — Math-Routed Sparse Transformer
 
 **Hardware / runtime**: CUDA GPU, 4 CPU threads, Python 3.12.13, Arch Linux  
-**Run**: `scripts/benchmark_attention.sh --sizes 64,128,256,512 --node-mode roots,trees`  
-**Benchmark path**: CUDA/Triton-only neighbor-sparse attention. CPU fallback removed from execution.  
-**Kernel**: `src/triton_attention.py::_nbr_sparse_attn_kernel`
+**Benchmark path**: CUDA/Triton neighbor-sparse attention through `scripts/benchmark_attention.sh`  
+**Kernel**: `src/triton_attention.py::_nbr_sparse_attn_kernel` and flat-output variant  
+**Current sparse block mode**: cached topology + top-`K` neighbor truncation
 
 ---
 
 ## Headline Finding
 
-**The sparse attention kernel now beats dense attention on CUDA.**
+The CUDA/Triton sparse attention kernel is validated, but the full sparse block only wins in selected cases.
 
-The neighbor-sparse path is routed through the fused Triton kernel. In the benchmark table,
-`s_trnc == s_tri`, which means the truncated sparse attention measurement is the Triton
-kernel measurement. `s_comp` is intentionally zero because the old `torch.compile` sparse
-path is no longer used in the benchmark hot path.
+The important correction is that the benchmark is **not** measuring attention over every allowed topology edge. It is measuring a routed top-`K` sparse attention path:
 
-At `n=512`:
+```text
+symbolic topology -> priority neighbors -> top-K selected neighbors -> Triton attention
+```
 
-- **roots**: Triton sparse attention is **3.08× faster** than dense attention.
-- **trees**: Triton sparse attention is **2.38× faster** than dense attention.
+Therefore sparse attention runtime scales primarily with:
 
-The attention bottleneck has moved: the kernel is no longer the main problem. Topology
-construction and block-level Python/symbolic overhead now dominate wall-clock time.
+```text
+T * K * D
+```
+
+not with:
+
+```text
+allowed_edges * D
+```
+
+The `allowed` column describes the full symbolic topology. The Triton kernel consumes the truncated neighbor table determined by `--max-neighbors`.
 
 ---
 
-## Attention-Only Timings
+## Current Implementation State
 
-All timings are milliseconds. `d_attn` is dense full attention. `s_tri` is the fused Triton
-neighbor-sparse attention kernel.
+The hot path now includes these optimizations:
 
-| n | mode | allowed | full | rel_red | d_attn | s_tri | dense / Triton |
-|---:|------|--------:|-----:|--------:|-------:|------:|---------------:|
-| 64  | roots | 1,030 | 4,096 | 74.85% | 0.131 | 0.084 | **1.56×** |
-| 128 | roots | 3,910 | 16,384 | 76.14% | 0.158 | 0.101 | **1.56×** |
-| 256 | roots | 15,046 | 65,536 | 77.04% | 0.209 | 0.129 | **1.62×** |
-| 512 | roots | 59,334 | 262,144 | 77.37% | 0.589 | 0.191 | **3.08×** |
-| 64  | trees | 2,162 | 4,096 | 47.22% | 0.121 | 0.083 | **1.46×** |
-| 128 | trees | 8,604 | 16,384 | 47.49% | 0.178 | 0.157 | **1.13×** |
-| 256 | trees | 34,246 | 65,536 | 47.74% | 0.196 | 0.144 | **1.36×** |
-| 512 | trees | 136,648 | 262,144 | 47.87% | 0.593 | 0.249 | **2.38×** |
+1. `TopologyCache` stores both `valid` and precompiled `valid_i8`.
+2. The Triton wrapper no longer performs live `valid.to(torch.int8).contiguous()`.
+3. The cached sparse block has a direct `forward_cached_fast_path` for `return_metadata=False`.
+4. Sparse attention uses a fused QKV projection cache for inference.
+5. A flat-output Triton sparse attention wrapper was added so sparse output can feed `out_proj` directly.
+6. A CUDA correctness test was added for the flat-output Triton wrapper.
 
-### Interpretation
-
-Roots mode is faster because it is much sparser:
-
-- `n=512 roots`: 59,334 allowed edges, **77.37%** relation reduction.
-- `n=512 trees`: 136,648 allowed edges, **47.87%** relation reduction.
-
-Trees mode is more semantically connected but more expensive:
-
-- `n=512 roots`: `symbolic_dependency = 0`
-- `n=512 trees`: `symbolic_dependency = 26,060`
-
-So the tradeoff is clear:
+CUDA correctness status:
 
 ```text
-roots = higher sparsity, faster kernel
- trees = richer symbolic dependency routing, more edges
+.venv-cuda/bin/python -m pytest -q tests/test_triton_attention.py
+9 passed
 ```
 
 ---
 
-## Topology Build Cost Is Now the Bottleneck
-
-The Triton attention kernel is fast. The symbolic topology builder is not.
-
-| n | mode | topo_ms | s_tri | topo / Triton |
-|---:|------|--------:|------:|--------------:|
-| 64  | roots | 15.897 | 0.084 | **189×** |
-| 128 | roots | 77.640 | 0.101 | **769×** |
-| 256 | roots | 256.576 | 0.129 | **1,989×** |
-| 512 | roots | 586.338 | 0.191 | **3,070×** |
-| 64  | trees | 10.742 | 0.083 | **129×** |
-| 128 | trees | 49.680 | 0.157 | **316×** |
-| 256 | trees | 164.201 | 0.144 | **1,140×** |
-| 512 | trees | 445.693 | 0.249 | **1,790×** |
-
-The current runtime shape is therefore:
-
-```text
-symbolic topology construction >> model/block Python overhead >> Triton attention
-```
-
-The attention kernel win is real, but it is hidden at the block/system level unless topology
-is compiled once and reused.
-
----
-
-## Block-Level Timings Expose Hot-Path Overhead
-
-At `n=512`:
-
-| mode | d_blk | sparse uncached | sparse cached |
-|------|------:|----------------:|--------------:|
-| roots | 0.939 | 426.116 | **2.819** |
-| trees | 0.934 | 272.982 | **2.710** |
-
-After the cache fix, these numbers are now consistent with a hot cached path:
-
-- `n=512 roots s_tri = 0.203ms`
-- `n=512 roots sparse cached block = 2.819ms`
-- `n=512 trees sparse cached block = 2.710ms`
-
-The uncached path still proves topology construction is expensive, but the cached path no
-longer re-enters topology construction on every forward.
-
-Remaining costs:
-
-1. Sparse path overhead around the Triton call.
-2. Neighbor-table use and tensor dispatch overhead.
-3. Feed-forward/projection work in the block.
-4. Optional metadata work when `return_metadata=True`.
-
-The target block path should look like this:
-
-```text
-precompiled (neighbors, valid) on CUDA + projected QKV -> Triton kernel -> output
-```
-
-not this:
-
-```text
-forward -> symbolic topology/cache/router work -> neighbor tensors -> Triton kernel -> output
-```
-
-
----
-
-## Hot-Path Cache Fix
-
-A critical cache bug was fixed after the first CUDA/Triton run.
-
-Previous code used:
-
-```python
-cache = self._topology_cache or TopologyCache(maxsize=1)
-```
-
-Because `TopologyCache` implements `__len__`, an empty shared cache is falsy. That meant the
-shared cache was discarded before it could warm, so the supposedly cached sparse block kept
-re-entering topology construction. The fix is explicit `None` checking:
-
-```python
-cache = self._topology_cache if self._topology_cache is not None else TopologyCache(maxsize=1)
-```
-
-The benchmark also uses `return_metadata=False` for the cached sparse block timing so the hot
-path skips router/diagnostic return work while preserving the default public API.
-
-### Cached block result after the fix
+## Full Sweep Result: n = 64..1024, K = 32
 
 Run:
 
 ```bash
-.venv-cuda/bin/python -m src.eval --benchmark --examples data/examples.jsonl   --sizes 64,128,256,512 --node-mode roots,trees --warmup 1 --iters 2
+scripts/benchmark_attention.sh --sizes 64,128,256,512,1024 --node-mode roots,trees
 ```
 
-| n | mode | d_blk | sparse uncached | sparse cached |
-|---:|------|------:|----------------:|--------------:|
-| 64  | roots | 0.744 | 13.774 | **0.989** |
-| 128 | roots | 0.932 | 42.936 | **1.501** |
-| 256 | roots | 0.577 | 126.898 | **2.280** |
-| 512 | roots | 0.939 | 426.116 | **2.819** |
-| 64  | trees | 0.688 | 9.769 | **1.322** |
-| 128 | trees | 0.934 | 35.736 | **1.064** |
-| 256 | trees | 1.228 | 71.900 | **1.288** |
-| 512 | trees | 0.934 | 272.982 | **2.710** |
+At `K=32`, the kernel-level result is strong:
 
-This changes the block-level conclusion:
+| n | mode | d_attn | s_tri | dense / sparse kernel |
+|---:|------|-------:|------:|----------------------:|
+| 1024 | roots | 1.968 | 0.312 | 6.31x |
+| 1024 | trees | 2.044 | 0.276 | 7.41x |
+
+The block-level result is mixed:
+
+| n | mode | d_blk | s_c | block result |
+|---:|------|------:|----:|--------------|
+| 128 | roots | 1.095 | 0.908 | sparse wins |
+| 128 | trees | 0.975 | 0.875 | sparse wins |
+| 1024 | trees | 2.498 | 2.432 | sparse wins slightly |
+| 1024 | roots | 2.470 | 4.408 | sparse loses |
+
+The strongest system-level positive signal is:
 
 ```text
-before: cached sparse block was hundreds of ms at n=512
- after: cached sparse block is ~2.7–2.8 ms at n=512
+1024 trees: s_c = 2.432 ms < d_blk = 2.498 ms
 ```
 
-The remaining gap to `d_blk` is now small enough to be explained by Triton sparse attention
-plus neighbor-table use and sparse path overhead, not repeated topology construction.
+This is only a small win, but it proves cached sparse block parity is reachable.
 
 ---
 
-## Scored Top-K Timing Is Currently Invalid
+## K-Scaling Result at n = 1024
 
-The benchmark reports:
+Runs:
 
-```text
-stk_atn = 0.000
+```bash
+scripts/benchmark_attention.sh --sizes 1024 --node-mode roots,trees --max-neighbors 16
+scripts/benchmark_attention.sh --sizes 1024 --node-mode roots,trees --max-neighbors 32
+scripts/benchmark_attention.sh --sizes 1024 --node-mode roots,trees --max-neighbors 64
+scripts/benchmark_attention.sh --sizes 1024 --node-mode roots,trees --max-neighbors 128
 ```
 
-for every row. That means scored-topK attention is not being measured successfully. It is
-likely failing inside the guarded scored-topK timing block and being swallowed by an exception
-handler.
+### Roots
 
-Do not use `stk_atn` as evidence until the exception is surfaced and fixed.
+Topology:
+
+```text
+allowed = 234,950
+full    = 1,048,576
+avg_k   = 229.4
+max_k   = 343
+```
+
+| max_neighbors | effective slots T*K | d_attn | s_tri | d_blk | s_c | block result |
+|--------------:|--------------------:|-------:|------:|------:|----:|--------------|
+| 16  | 16,384  | 2.051 | 0.292 | 2.417 | 4.274 | sparse loses |
+| 32  | 32,768  | 1.973 | 0.326 | 2.691 | 4.306 | sparse loses |
+| 64  | 65,536  | 1.979 | 0.375 | 2.461 | 4.796 | sparse loses |
+| 128 | 131,072 | 1.992 | 0.608 | 2.533 | 5.308 | sparse loses |
+
+Roots interpretation:
+
+- Kernel time increases with `K`, as expected.
+- Block time remains dominated by non-kernel overhead.
+- The roots cached sparse block does not beat dense at n=1024 for any tested `K`.
+- Lowering `K` helps, but not enough to overcome block overhead.
+
+### Trees
+
+Topology:
+
+```text
+allowed = 545,422
+full    = 1,048,576
+avg_k   = 532.6
+max_k   = 778
+```
+
+| max_neighbors | effective slots T*K | d_attn | s_tri | d_blk | s_c | block result |
+|--------------:|--------------------:|-------:|------:|------:|----:|--------------|
+| 16  | 16,384  | 1.973 | 0.289 | 2.467 | 2.241 | sparse wins |
+| 32  | 32,768  | 1.961 | 0.294 | 2.438 | 2.789 | sparse loses |
+| 64  | 65,536  | 2.003 | 0.432 | 2.403 | 3.296 | sparse loses |
+| 128 | 131,072 | 2.009 | 0.475 | 2.393 | 2.581 | sparse loses |
+
+Trees interpretation:
+
+- The best tree result is `K=16`, where cached sparse block wins:
+
+```text
+s_c = 2.241 ms < d_blk = 2.467 ms
+```
+
+- Increasing `K` increases kernel work and usually worsens block-level latency.
+- `K=32` has shown near-parity or slight wins in other runs, but the K-sweep shows it is not stable enough to claim a general block win.
+- For the current implementation, the practical operating point is likely `K=16` for large tree-shaped inputs.
 
 ---
 
-## What Is Now Proven
+## Correct Scaling Interpretation
+
+The table should not be read as:
 
 ```text
-✓ CUDA/Triton neighbor-sparse attention is wired into the benchmark path
-✓ CPU fallback is removed from benchmark execution
-✓ Triton sparse attention beats dense attention for n=64..512 on this CUDA run
-✓ At n=512, sparse attention is 3.08× faster than dense in roots mode
-✓ At n=512, sparse attention is 2.38× faster than dense in trees mode
-✓ Roots preserves ~75–77% relation reduction across n=64..512
-✓ Trees preserves ~47–48% relation reduction while adding symbolic dependency edges
-✓ The bottleneck has moved from attention compute to topology/block infrastructure
+runtime scales with allowed edges
+```
+
+It should be read as:
+
+```text
+runtime scales with selected top-K neighbor slots
+```
+
+For `n=1024`:
+
+| mode | allowed edges | K | kernel slots T*K |
+|------|--------------:|--:|-----------------:|
+| roots | 234,950 | 32 | 32,768 |
+| trees | 545,422 | 32 | 32,768 |
+
+Even though trees have about 2.32x more allowed edges than roots, the Triton kernel sees the same number of slots when `K` is fixed. That is why `s_tri` is similar for roots and trees at the same `K`.
+
+The topology edge count matters for:
+
+1. topology construction cost,
+2. neighbor priority selection,
+3. model quality,
+4. whether a small `K` preserves enough symbolic context.
+
+It does not directly determine Triton sparse attention runtime once top-`K` truncation is applied.
+
+---
+
+## Topology Build Remains Offline-Only
+
+At `n=1024`, topology construction remains far too expensive for a live forward path:
+
+| mode | topo_ms range in latest runs |
+|------|-----------------------------:|
+| roots | about 2.47s to 2.92s |
+| trees | about 1.26s to 1.67s |
+
+The architecture must remain two-stage:
+
+```text
+Stage 1: compile/cache topology once
+Stage 2: run repeated model forwards using cached CUDA neighbors + valid_i8
+```
+
+Any benchmark that includes topology construction in every forward is measuring topology generation, not model inference.
+
+---
+
+## What Is Proven
+
+```text
+✓ Triton sparse attention is correct on CUDA: 9 tests passed
+✓ Sparse attention kernel is much faster than dense attention at n=1024
+✓ Runtime scales with T*K, not total allowed edges
+✓ Cached sparse block can beat dense block in selected large-tree cases
+✓ K is now an explicit accuracy/speed control knob
+✓ Topology construction must be cached/offline
 ```
 
 ---
@@ -215,64 +225,44 @@ Do not use `stk_atn` as evidence until the exception is surfaced and fixed.
 ## What Is Not Yet Proven
 
 ```text
-✓ Cached sparse block no longer rebuilds topology on every forward
-✗ End-to-end model speedup
-✗ Cached sparse block is still slower than full dense block, though now low single-digit ms
-✗ Valid scored-topK attention timings
-✗ Training-speed improvement
+✗ Universal cached sparse block speedup
+✗ Roots-mode block-level speedup at n=1024
+✗ End-to-end training or inference speedup including all model infrastructure
+✗ Quality retention as K is reduced to 16 or 32
+✗ Valid scored-topK attention timing; stk_atn is still reported as 0.000
 ```
 
 ---
 
-## Architecture Verdict
+## Engineering Verdict
 
-The central kernel-level claim is now stronger than before:
+The right claim is now:
 
-> Math-structured sparse routing can produce a neighbor-sparse attention pattern that runs
-> faster than dense attention when executed by a fused CUDA/Triton kernel.
+> Math routing can compile a large symbolic topology into a bounded top-K neighbor table, and the resulting Triton sparse attention path can beat dense attention. Cached sparse blocks can cross dense-block parity when K is small enough and topology structure is favorable.
 
-This is now shown directly on CUDA, not just CPU.
+The wrong claim would be:
 
-However, the system-level claim is still blocked by infrastructure overhead:
+> Sparse attention runtime scales with all allowed symbolic edges.
 
-> The model cannot show wall-clock wins until symbolic topology, embedding, routing, and
-> diagnostics are removed from the repeated forward hot path.
-
-The right abstraction is a two-stage pipeline:
-
-```text
-Stage 1: compile symbolic graph once
-         nodes + shapes + relations -> neighbors, valid, diagnostics
-
-Stage 2: run model repeatedly
-         Q, K, V + cached CUDA neighbors/valid -> Triton attention
-```
-
-The current benchmark proves Stage 2 can win. The next engineering step is to make the model
-actually use Stage 2 without re-entering Stage 1.
+It does not. With top-K truncation, runtime scales with `T*K`.
 
 ---
 
-## Next Step
+## Recommended Next Step
 
-Make cached sparse block timing approximate the kernel-level result.
+The next work item is quality/performance co-design around `K`:
 
-Concrete target:
+1. Evaluate task quality at `K=16`, `K=32`, `K=64`, and `K=128`.
+2. Keep `K=16` as the current large-tree performance baseline.
+3. Profile `s_c` into projection, Triton attention, output projection, FFN, LayerNorm, and Python dispatch.
+4. Do not spend more time optimizing topology build for live inference; topology build belongs in the cache/compiler layer.
 
-```text
-sparse_block_cached ~= dense_block + Triton_sparse_attention_overhead
-```
-
-Immediate work:
-
-1. Precompute node embeddings and topology outside `forward`.
-2. Store `neighbors` and `valid` as CUDA tensors in the cache.
-3. Add a no-diagnostics/no-router fast path for benchmark and training.
-4. Surface scored-topK exceptions instead of swallowing them.
-5. Re-run the benchmark with block-level timing after the hot path is cleaned.
-
-Success criterion:
+Target acceptance condition:
 
 ```text
-s_c at n=512 should fall from hundreds of ms to low single-digit ms.
+For n=1024 trees, K=16:
+  maintain quality while keeping s_c < d_blk
+
+For roots:
+  identify and remove the block overhead that keeps s_c > d_blk even when K is small
 ```

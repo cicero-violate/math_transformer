@@ -65,6 +65,22 @@ class MathRoutedTransformerBlock(nn.Module):
         self.embedder = MathEmbedder()
         self.router = OperatorRouter()
 
+    def forward_cached_fast_path(
+        self,
+        x: torch.Tensor,
+        nodes: list[MathNode],
+        env: dict[str, tuple[int, ...]] | None = None,
+    ) -> torch.Tensor:
+        cache = self._topology_cache if self._topology_cache is not None else TopologyCache(maxsize=1)
+        z = cache.get_or_encode(nodes, self.embedder)
+        cached: CachedTopology = cache.get_or_build(
+            nodes, z, env, self.topology, self.max_neighbors, device=x.device
+        )
+        nb = cached.neighbors.to(x.device)
+        valid_i8 = cached.valid_i8.to(x.device)
+        x = x.add(self.drop(self.attn(self.norm1(x), nb, valid_i8)))
+        return x.add(self.drop(self.ff(self.norm2(x))))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -80,6 +96,14 @@ class MathRoutedTransformerBlock(nn.Module):
         Returns (output, mask, route_info, diagnostics)
         """
         B, T, _ = x.shape
+        if (
+            self.attention_mode == "neighbor_sparse"
+            and not return_metadata
+            and nodes is not None
+            and len(nodes) == T
+        ):
+            return self.forward_cached_fast_path(x, nodes, env), None, None, None
+
         mask: torch.Tensor | None = None
         route_info: list[RouteResult] | None = None
         diag: MaskDiagnostics | None = None
@@ -98,7 +122,7 @@ class MathRoutedTransformerBlock(nn.Module):
                 )
                 mask = cached.mask.to(x.device)
                 nb = cached.neighbors.to(x.device)
-                valid = cached.valid.to(x.device)
+                valid = cached.valid_i8.to(x.device)
                 diag = cached.diagnostics
             else:
                 np_mask, diag = self.topology.build_detailed(nodes, z, env)

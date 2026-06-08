@@ -15,6 +15,7 @@ class CachedTopology:
     priority: np.ndarray | torch.Tensor    # (T, T) int8
     neighbors: torch.Tensor                 # (T, K) long
     valid: torch.Tensor                     # (T, K) bool
+    valid_i8: torch.Tensor                  # (T, K) int8
     diagnostics: MaskDiagnostics
 
 
@@ -118,6 +119,7 @@ class TopologyCache:
                 priority=priority_t,
                 neighbors=nb,
                 valid=valid,
+                valid_i8=valid.char(),
                 diagnostics=diag,
             )
         else:
@@ -137,6 +139,7 @@ class TopologyCache:
                 priority=priority,
                 neighbors=nb,
                 valid=valid,
+                valid_i8=valid.char(),
                 diagnostics=diag,
             )
 

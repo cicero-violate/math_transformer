@@ -46,10 +46,10 @@ if TRITON_AVAILABLE:
         Each program handles one (batch, head, token) output row.
         """
         pid = tl.program_id(0)
-        t   = pid % T
-        bh  = pid // T
-        b   = bh // H
-        h   = bh % H
+        h   = pid % H
+        bt  = pid // H
+        t   = bt % T
+        b   = bt // T
 
         d_idx = tl.arange(0, BLOCK_D)   # (BLOCK_D,)
         k_idx = tl.arange(0, BLOCK_K)   # (BLOCK_K,)
@@ -103,6 +103,71 @@ if TRITON_AVAILABLE:
         )
 
 
+    @triton.jit
+    def _nbr_sparse_attn_flat_kernel(
+        Q_ptr, K_ptr, V_ptr,
+        Nb_ptr, Vld_ptr,
+        Out_ptr,
+        q_sb, q_sh, q_st,
+        k_sb, k_sh, k_st,
+        v_sb, v_sh, v_st,
+        o_sb, o_st,
+        n_st,
+        T, H, D, K,
+        scale,
+        BLOCK_D: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        t   = pid % T
+        bh  = pid // T
+        b   = bh // H
+        h   = bh % H
+
+        d_idx = tl.arange(0, BLOCK_D)
+        k_idx = tl.arange(0, BLOCK_K)
+
+        q = tl.load(
+            Q_ptr + b * q_sb + h * q_sh + t * q_st + d_idx,
+            mask=d_idx < D, other=0.0,
+        )
+
+        nb  = tl.load(Nb_ptr  + t * n_st + k_idx, mask=k_idx < K, other=0)
+        vld = tl.load(Vld_ptr + t * n_st + k_idx, mask=k_idx < K, other=0).to(tl.float32)
+
+        k_ptrs = K_ptr + b * k_sb + h * k_sh + nb[:, None] * k_st + d_idx[None, :]
+        k_vecs = tl.load(
+            k_ptrs,
+            mask=(k_idx[:, None] < K) & (d_idx[None, :] < D),
+            other=0.0,
+        )
+
+        scores = tl.sum(k_vecs * q[None, :], axis=1) * scale
+        scores = tl.where((k_idx < K) & (vld > 0), scores, -float('inf'))
+
+        s_max = tl.max(scores, axis=0)
+        s_max = tl.where(s_max > -float('inf'), s_max, 0.0)
+        scores_exp = tl.exp(scores - s_max)
+        scores_exp = tl.where((k_idx < K) & (vld > 0), scores_exp, 0.0)
+        s_sum = tl.sum(scores_exp, axis=0) + 1e-9
+        probs = scores_exp / s_sum
+
+        v_ptrs = V_ptr + b * v_sb + h * v_sh + nb[:, None] * v_st + d_idx[None, :]
+        v_vecs = tl.load(
+            v_ptrs,
+            mask=(k_idx[:, None] < K) & (d_idx[None, :] < D),
+            other=0.0,
+        )
+
+        out = tl.sum(probs[:, None] * v_vecs, axis=0)
+        flat_d = h * D + d_idx
+        tl.store(
+            Out_ptr + b * o_sb + t * o_st + flat_d,
+            out,
+            mask=d_idx < D,
+        )
+
+
 def triton_neighbor_attention(
     q: torch.Tensor,           # (B, H, T, D) — contiguous on GPU
     k: torch.Tensor,
@@ -126,11 +191,7 @@ def triton_neighbor_attention(
     B, H, T, D = q.shape
     K = neighbors.shape[1]
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    neighbors = neighbors.contiguous()
-    valid_i8 = valid.to(torch.int8).contiguous()
+    valid_i8 = valid
 
     out = torch.empty_like(q)
 
@@ -146,6 +207,46 @@ def triton_neighbor_attention(
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
+        neighbors.stride(0),
+        T=T, H=H, D=D, K=K,
+        scale=1.0 / math.sqrt(D),
+        BLOCK_D=BLOCK_D,
+        BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
+def triton_neighbor_attention_flat(
+    q: torch.Tensor,           # (B, H, T, D), strided CUDA tensor accepted
+    k: torch.Tensor,
+    v: torch.Tensor,
+    neighbors: torch.Tensor,   # (T, K) LongTensor on GPU
+    valid: torch.Tensor,       # (T, K) int8 mask on GPU
+) -> torch.Tensor:
+    """Return sparse attention as (B, T, H*D) without an extra collect einsum."""
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("triton is not installed")
+    if not q.is_cuda or not k.is_cuda or not v.is_cuda or not neighbors.is_cuda:
+        raise RuntimeError("triton_neighbor_attention_flat requires CUDA tensors")
+    if valid is None or not valid.is_cuda:
+        raise RuntimeError("triton_neighbor_attention_flat requires a CUDA valid mask")
+
+    B, H, T, D = q.shape
+    K = neighbors.shape[1]
+    out = torch.empty((B, T, H * D), device=q.device, dtype=q.dtype)
+
+    BLOCK_D = triton.next_power_of_2(D)
+    BLOCK_K = triton.next_power_of_2(K)
+    grid = (B * H * T,)
+
+    _nbr_sparse_attn_flat_kernel[grid](
+        q, k, v,
+        neighbors, valid,
+        out,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1),
         neighbors.stride(0),
         T=T, H=H, D=D, K=K,
         scale=1.0 / math.sqrt(D),

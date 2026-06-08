@@ -55,6 +55,21 @@ class _AttentionBase(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.out_proj(self.dropout(out))
 
+    def _project_bhtd(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        H, Dh = self.n_heads, self.d_head
+        def _p(proj: nn.Linear) -> torch.Tensor:
+            w = proj.weight.view(H, Dh, self.d_model)
+            return torch.einsum("btd,hfd->bhtf", x, w)
+        return _p(self.q_proj), _p(self.k_proj), _p(self.v_proj)
+
+    def _collect_bhtd(self, out: torch.Tensor) -> torch.Tensor:
+        H, Dh = self.n_heads, self.d_head
+        w = self.out_proj.weight.view(self.d_model, H, Dh)
+        y = torch.einsum("bhtd,ohd->bto", self.dropout(out), w)
+        if self.out_proj.bias is not None:
+            y = y + self.out_proj.bias
+        return y
+
 
 # ── Dense masked attention ────────────────────────────────────────────────────
 
@@ -97,17 +112,62 @@ class NeighborSparseMathAttention(_AttentionBase):
       valid     : (T, K) BoolTensor  — True = real neighbor, False = padding
     """
 
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0) -> None:
+        super().__init__(d_model, n_heads, dropout)
+        self._qkv_weight_cache: torch.Tensor | None = None
+        self._qkv_weight_versions: tuple[int, int, int] | None = None
+
+    def _fused_qkv_weight(self) -> torch.Tensor:
+        if torch.is_grad_enabled() and self.training:
+            return torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            )
+        versions = (
+            self.q_proj.weight._version,
+            self.k_proj.weight._version,
+            self.v_proj.weight._version,
+        )
+        cache = self._qkv_weight_cache
+        if (
+            cache is None
+            or self._qkv_weight_versions != versions
+            or cache.device != self.q_proj.weight.device
+            or cache.dtype != self.q_proj.weight.dtype
+        ):
+            self._qkv_weight_cache = torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            ).detach()
+            self._qkv_weight_versions = versions
+        return self._qkv_weight_cache
+
+    def _project_qkv_bhtd(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, _ = x.shape
+        H, Dh = self.n_heads, self.d_head
+        qkv = F.linear(x, self._fused_qkv_weight())
+        q, k, v = qkv.view(B, T, 3, H, Dh).unbind(dim=2)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
     def forward(
         self,
         x: torch.Tensor,
         neighbors: torch.Tensor,
         valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from .triton_attention import triton_neighbor_attention
+        from .triton_attention import (
+            triton_neighbor_attention_flat,
+            TRITON_AVAILABLE,
+        )
+        from .sparse_attention import neighbor_attention
         B, T, _ = x.shape
-        q, k, v = self._project(x)
-        out = triton_neighbor_attention(q, k, v, neighbors, valid)
-        return self._collect(out, B, T)
+        q, k, v = self._project_qkv_bhtd(x)
+        if (not TRITON_AVAILABLE) or (not x.is_cuda):
+            out = neighbor_attention(q, k, v, neighbors, valid.bool() if valid is not None else valid)
+            out = out.transpose(1, 2).reshape(B, T, self.d_model)
+        else:
+            out = triton_neighbor_attention_flat(q, k, v, neighbors, valid)
+        return self.out_proj(self.dropout(out))
 
 
 # ── Aliases / backwards compat ────────────────────────────────────────────────
