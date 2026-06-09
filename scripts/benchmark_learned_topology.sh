@@ -46,6 +46,22 @@ if [[ -n "$LEARNED_TRITON_BLOCK_K" ]]; then
   LEARNED_TRITON_ARGS+=(--triton-block-k "$LEARNED_TRITON_BLOCK_K")
 fi
 
+HAND_PAIRED_TRITON_ARGS=()
+if [[ -n "$HAND_TRITON_BLOCK_D" ]]; then
+  HAND_PAIRED_TRITON_ARGS+=(--hand-triton-block-d "$HAND_TRITON_BLOCK_D")
+fi
+if [[ -n "$HAND_TRITON_BLOCK_K" ]]; then
+  HAND_PAIRED_TRITON_ARGS+=(--hand-triton-block-k "$HAND_TRITON_BLOCK_K")
+fi
+
+LEARNED_PAIRED_TRITON_ARGS=()
+if [[ -n "$LEARNED_TRITON_BLOCK_D" ]]; then
+  LEARNED_PAIRED_TRITON_ARGS+=(--learned-triton-block-d "$LEARNED_TRITON_BLOCK_D")
+fi
+if [[ -n "$LEARNED_TRITON_BLOCK_K" ]]; then
+  LEARNED_PAIRED_TRITON_ARGS+=(--learned-triton-block-k "$LEARNED_TRITON_BLOCK_K")
+fi
+
 quality_log="$TMP_DIR/quality.log"
 hand_dir="$TMP_DIR/hand"
 learned_dir="$TMP_DIR/learned"
@@ -57,18 +73,13 @@ mkdir -p "$hand_dir" "$learned_dir"
   --quality-k "$HAND_K" --quality-device "$DEVICE" \
   --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" | tee "$quality_log"
 
-"$PYTHON" -m src.eval --benchmark --profile-prepared-block --sizes "$BENCH_N" \
+"$PYTHON" -m src.eval --paired-learned-topology-benchmark --sizes "$BENCH_N" \
   --node-mode "$BENCH_NODE_MODE" --examples "$EXAMPLES" \
-  --topology-mode middle_preserving_topk --fixed-k "$HAND_K" --max-neighbors "$HAND_K" \
-  --middle-bridge-width 1 --warmup 3 --iters "$BENCH_STEPS" \
-  --benchmark-seed "$BENCH_SEED" "${HAND_TRITON_ARGS[@]}" --save-dir "$hand_dir" >/dev/null
-
-"$PYTHON" -m src.eval --benchmark --profile-prepared-block --sizes "$BENCH_N" \
-  --node-mode "$BENCH_NODE_MODE" --examples "$EXAMPLES" \
-  --topology-mode learned_topology --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" \
-  --fixed-k "$LEARNED_K" --max-neighbors "$LEARNED_K" --middle-bridge-width 1 \
+  --fixed-k "$HAND_K" --learned-k "$LEARNED_K" \
+  --learned-scorer-checkpoint "$SCORER" --middle-bridge-width 1 \
   --warmup 3 --iters "$BENCH_STEPS" --benchmark-seed "$BENCH_SEED" \
-  "${LEARNED_TRITON_ARGS[@]}" --save-dir "$learned_dir" >/dev/null
+  "${HAND_PAIRED_TRITON_ARGS[@]}" "${LEARNED_PAIRED_TRITON_ARGS[@]}" \
+  --hand-save-dir "$hand_dir" --learned-save-dir "$learned_dir" >/dev/null
 
 "$PYTHON" - "$quality_log" "$hand_dir" "$learned_dir" "$HAND_K" "$LEARNED_K" "$ALLOW_FAIL" <<'PY2'
 from __future__ import annotations

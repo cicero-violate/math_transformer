@@ -742,6 +742,235 @@ def run_benchmark(
     return report
 
 
+def run_paired_learned_topology_benchmark(
+    n: int,
+    node_mode: str = "trees",
+    d_model: int = 64,
+    n_heads: int = 4,
+    d_ff: int = 128,
+    topk: int = 3,
+    local_window: int = 1,
+    hand_k: int = 16,
+    learned_k: int = 6,
+    n_warmup: int = 3,
+    n_iter: int = 100,
+    exprs: list[str] | None = None,
+    examples_path: str | None = None,
+    middle_bridge_width: int = 1,
+    learned_scorer_checkpoint: str | None = None,
+    hand_triton_block_d: int | None = None,
+    hand_triton_block_k: int | None = None,
+    learned_triton_block_d: int | None = None,
+    learned_triton_block_k: int | None = None,
+    benchmark_seed: int | None = None,
+    hand_save_dir: str | None = None,
+    learned_save_dir: str | None = None,
+) -> tuple[BenchmarkReport, BenchmarkReport]:
+    """Benchmark hand and learned prepared topologies with one shared block/input.
+
+    This isolates topology/neighbor-table runtime effects from K-independent block
+    variance by using identical LayerNorm/QKV/out-proj/FFN weights and identical
+    input for both topology timings.
+    """
+    from .model import MathRoutedTransformerBlock
+    from .topology import TopologyBuilder
+    from .learned_topology_runtime import LearnedTopologyBuilder
+    from .topology_cache import TopologyCache, PreparedTopology
+    from .embedder import MathEmbedder
+    from .triton_attention import TRITON_AVAILABLE
+    import torch.nn as nn
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required: CPU benchmark path has been removed")
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for neighbor-sparse attention")
+    if not learned_scorer_checkpoint:
+        raise ValueError("--learned-scorer-checkpoint is required for paired learned benchmark")
+    device = torch.device("cuda")
+
+    def _reset_benchmark_rng() -> None:
+        if benchmark_seed is None:
+            return
+        torch.manual_seed(benchmark_seed)
+        torch.cuda.manual_seed_all(benchmark_seed)
+        np.random.seed(benchmark_seed)
+
+    def _next_pow2(x: int) -> int:
+        return 1 << (max(int(x), 1) - 1).bit_length()
+
+    def _effective_block_d(block_d: int | None, d_head: int) -> int:
+        return int(block_d) if block_d is not None else _next_pow2(d_head)
+
+    def _effective_block_k(block_k: int | None, k: int) -> int:
+        return int(block_k) if block_k is not None else _next_pow2(k)
+
+    if exprs is None:
+        exprs = [
+            "add(matmul(A, x), b)",
+            "add(matmul(W, h), c)",
+            "grad(f, x)",
+            "sum(i, x_i)",
+            "matmul(Q, K)",
+            "constraint(leq(matmul(A, x), b))",
+        ]
+
+    env = _load_env_from_examples(examples_path)
+    nodes = _collect_nodes_trees(exprs, n) if node_mode == "trees" else _collect_nodes_roots(exprs, n)
+    embedder = MathEmbedder()
+    z = embedder.encode_batch(nodes)
+    z_t = torch.from_numpy(z).float()
+
+    hand_builder = TopologyBuilder(
+        topk=topk,
+        local_window=local_window,
+        topology_mode="middle_preserving_topk",
+        fixed_k=hand_k,
+        middle_bridge_width=middle_bridge_width,
+    )
+    learned_builder = LearnedTopologyBuilder(
+        learned_scorer_checkpoint,
+        fixed_k=learned_k,
+        topk=topk,
+        local_window=local_window,
+        middle_bridge_width=middle_bridge_width,
+        device=device,
+    )
+    cache = TopologyCache()
+    hand_prepared = cache.get_or_prepare(
+        nodes, z, env or None, hand_builder, max_neighbors=hand_k, device=device
+    )
+    learned_prepared = cache.get_or_prepare(
+        nodes, z, env or None, learned_builder, max_neighbors=learned_k, device=device
+    )
+
+    _reset_benchmark_rng()
+    proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
+    with torch.no_grad():
+        x_dm = proj(z_t.to(device).unsqueeze(0))
+
+    block = MathRoutedTransformerBlock(
+        d_model=d_model,
+        n_heads=n_heads,
+        d_ff=d_ff,
+        topk=topk,
+        local_window=local_window,
+        attention_mode="neighbor_sparse",
+        max_neighbors=hand_k,
+        topology_cache=TopologyCache(),
+        topology_mode="middle_preserving_topk",
+        fixed_k=hand_k,
+        middle_bridge_width=middle_bridge_width,
+        triton_block_d=hand_triton_block_d,
+        triton_block_k=hand_triton_block_k,
+    ).to(device)
+    block.eval()
+
+    def _install_prepared(
+        prepared: PreparedTopology,
+        triton_block_d: int | None,
+        triton_block_k: int | None,
+    ) -> None:
+        block.max_neighbors = prepared.k
+        block._prepared_topology = prepared
+        block.static_neighbors = prepared.neighbors.to(device).contiguous()
+        block.static_valid_i8 = prepared.valid_i8.to(device).contiguous()
+        block.attn.triton_block_d = triton_block_d
+        block.attn.triton_block_k = triton_block_k
+
+    def _profile_once() -> dict[str, float]:
+        with torch.no_grad():
+            _, timings = block.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+        return timings
+
+    hand_samples: list[dict[str, float]] = []
+    learned_samples: list[dict[str, float]] = []
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            _install_prepared(hand_prepared, hand_triton_block_d, hand_triton_block_k)
+            _profile_once()
+            _install_prepared(learned_prepared, learned_triton_block_d, learned_triton_block_k)
+            _profile_once()
+        for _ in range(n_iter):
+            _install_prepared(hand_prepared, hand_triton_block_d, hand_triton_block_k)
+            hand_samples.append(_profile_once())
+            _install_prepared(learned_prepared, learned_triton_block_d, learned_triton_block_k)
+            learned_samples.append(_profile_once())
+
+    bucket_keys = [
+        "topology_prepare_ms",
+        "norm1_ms",
+        "qkv_ms",
+        "attention_kernel_ms",
+        "out_proj_ms",
+        "residual1_ms",
+        "norm2_ms",
+        "ffn_ms",
+        "residual2_ms",
+        "total_block_ms",
+    ]
+
+    def _median_buckets(samples: list[dict[str, float]]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key in bucket_keys:
+            vals = [float(s.get(key, 0.0)) for s in samples]
+            out[key] = float(np.median(np.array(vals))) if vals else 0.0
+        return out
+
+    hand_buckets = _median_buckets(hand_samples)
+    learned_buckets = _median_buckets(learned_samples)
+
+    def _make_report(
+        prepared: PreparedTopology,
+        buckets: dict[str, float],
+        triton_block_d: int | None,
+        triton_block_k: int | None,
+    ) -> BenchmarkReport:
+        diag = prepared.diagnostics
+        total = float(buckets.get("total_block_ms", 0.0))
+        attn = float(buckets.get("attention_kernel_ms", 0.0))
+        non_attn = max(0.0, total - attn)
+        selector_results = {
+            "paired_prepared_shared_block": {
+                **{k: float(v) for k, v in buckets.items()},
+                "same_block_weights": 1.0,
+                "same_input": 1.0,
+            }
+        }
+        return BenchmarkReport(
+            n=n,
+            node_mode=node_mode,
+            k=topk,
+            full_edges=n * n,
+            allowed_edges=diag.allowed_edges,
+            avg_k=diag.avg_k,
+            max_k=diag.max_k,
+            padding_ratio=diag.padding_ratio,
+            sparsity_ratio=diag.sparsity_ratio,
+            relation_reduction=diag.relation_reduction,
+            device=str(device),
+            triton_block_d=triton_block_d,
+            triton_block_k=triton_block_k,
+            effective_triton_block_d=_effective_block_d(triton_block_d, d_model // n_heads),
+            effective_triton_block_k=_effective_block_k(triton_block_k, prepared.k),
+            triton_sparse_attn_ms=attn,
+            sparse_block_cached_ms=total,
+            prepared_static_sparse_block_ms=total,
+            prepared_static_sparse_attention_ms=attn,
+            prepared_static_sparse_non_attention_ms=non_attn,
+            selector_results=selector_results,
+            by_relation=diag.by_relation,
+        )
+
+    hand_report = _make_report(hand_prepared, hand_buckets, hand_triton_block_d, hand_triton_block_k)
+    learned_report = _make_report(learned_prepared, learned_buckets, learned_triton_block_d, learned_triton_block_k)
+
+    if hand_save_dir:
+        _save_report(hand_report, hand_save_dir)
+    if learned_save_dir:
+        _save_report(learned_report, learned_save_dir)
+    return hand_report, learned_report
+
+
 def run_quality_eval(
     examples_path: str,
     k_values: list[int],
@@ -1040,6 +1269,41 @@ def _print_row(r: BenchmarkReport) -> None:
             )
 
 
+def _run_paired_learned_topology_benchmark_cli(args: argparse.Namespace) -> None:
+    sizes = [int(x) for x in args.sizes.split(",")]
+    modes = args.node_mode.split(",")
+    if len(sizes) != 1 or len(modes) != 1:
+        raise ValueError("paired learned benchmark expects exactly one size and one node mode")
+    hand_report, learned_report = run_paired_learned_topology_benchmark(
+        n=sizes[0],
+        node_mode=modes[0],
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        topk=args.topk,
+        local_window=args.local_window,
+        hand_k=args.fixed_k,
+        learned_k=args.learned_k,
+        n_warmup=args.warmup,
+        n_iter=args.iters,
+        examples_path=args.examples,
+        middle_bridge_width=args.middle_bridge_width,
+        learned_scorer_checkpoint=args.learned_scorer_checkpoint,
+        hand_triton_block_d=args.hand_triton_block_d,
+        hand_triton_block_k=args.hand_triton_block_k,
+        learned_triton_block_d=args.learned_triton_block_d,
+        learned_triton_block_k=args.learned_triton_block_k,
+        benchmark_seed=args.benchmark_seed,
+        hand_save_dir=args.hand_save_dir,
+        learned_save_dir=args.learned_save_dir,
+    )
+    print("paired_prepared_shared_block=true same_input=true same_block_weights=true")
+    print("hand")
+    print(hand_report)
+    print("learned")
+    print(learned_report)
+
+
 def _run_benchmark_cli(args: argparse.Namespace) -> None:
     sizes = [int(x) for x in args.sizes.split(",")]
     modes = args.node_mode.split(",")
@@ -1113,6 +1377,7 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Eval / benchmark Math-Routed Transformer")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--paired-learned-topology-benchmark", action="store_true", dest="paired_learned_topology_benchmark")
     parser.add_argument('--profile-prepared-block', action="store_true", dest="profile_prepared_block")
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--sizes", default="8,16,32")
@@ -1148,8 +1413,16 @@ def main() -> None:
     parser.add_argument("--triton-block-d", type=int, default=None, dest="triton_block_d")
     parser.add_argument("--triton-block-k", type=int, default=None, dest="triton_block_k")
     parser.add_argument("--benchmark-seed", type=int, default=None, dest="benchmark_seed")
+    parser.add_argument("--hand-triton-block-d", type=int, default=None, dest="hand_triton_block_d")
+    parser.add_argument("--hand-triton-block-k", type=int, default=None, dest="hand_triton_block_k")
+    parser.add_argument("--learned-triton-block-d", type=int, default=None, dest="learned_triton_block_d")
+    parser.add_argument("--learned-triton-block-k", type=int, default=None, dest="learned_triton_block_k")
+    parser.add_argument("--hand-save-dir", default=None, dest="hand_save_dir")
+    parser.add_argument("--learned-save-dir", default=None, dest="learned_save_dir")
     parser.add_argument("--save-dir", default=None, dest="save_dir")
     args = parser.parse_args()
+    if args.paired_learned_topology_benchmark:
+        _run_paired_learned_topology_benchmark_cli(args)
     if args.benchmark:
         _run_benchmark_cli(args)
     if args.quality:
