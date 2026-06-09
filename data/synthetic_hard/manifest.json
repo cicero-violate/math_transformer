@@ -1,0 +1,32 @@
+{
+  "hard": true,
+  "max_depth": 5,
+  "route_fraction": 0.9,
+  "seed": 77,
+  "splits": {
+    "test": {
+      "invalid_shape_records": 86,
+      "path": "data/synthetic_hard/test.jsonl",
+      "records": 2000,
+      "route_records": 1779,
+      "shape_records": 221,
+      "unique_route_expr": 1779
+    },
+    "train": {
+      "invalid_shape_records": 407,
+      "path": "data/synthetic_hard/train.jsonl",
+      "records": 10000,
+      "route_records": 8982,
+      "shape_records": 1018,
+      "unique_route_expr": 8977
+    },
+    "val": {
+      "invalid_shape_records": 88,
+      "path": "data/synthetic_hard/val.jsonl",
+      "records": 2000,
+      "route_records": 1786,
+      "shape_records": 214,
+      "unique_route_expr": 1786
+    }
+  }
+}

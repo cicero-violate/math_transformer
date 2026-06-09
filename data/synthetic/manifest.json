@@ -1,0 +1,27 @@
+{
+  "route_fraction": 0.6,
+  "seed": 2,
+  "splits": {
+    "test": {
+      "invalid_shape_records": 1564,
+      "path": "data/synthetic/test.jsonl",
+      "records": 10000,
+      "route_records": 5988,
+      "shape_records": 4012
+    },
+    "train": {
+      "invalid_shape_records": 32081,
+      "path": "data/synthetic/train.jsonl",
+      "records": 200000,
+      "route_records": 120105,
+      "shape_records": 79895
+    },
+    "val": {
+      "invalid_shape_records": 1552,
+      "path": "data/synthetic/val.jsonl",
+      "records": 10000,
+      "route_records": 6068,
+      "shape_records": 3932
+    }
+  }
+}

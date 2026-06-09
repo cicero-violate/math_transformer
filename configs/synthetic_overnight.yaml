@@ -1,0 +1,25 @@
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.1
+  topk: 1
+  local_window: 1
+
+training:
+  batch_size: 4
+  lr: 1.0e-3
+  max_steps: 100
+  warmup_steps: 10
+
+data:
+  path: data/examples.jsonl
+  max_seq_len: 32
+
+eval:
+  interval: 10
+  metrics:
+    - op_accuracy
+    - route_accuracy
+    - sparsity_ratio

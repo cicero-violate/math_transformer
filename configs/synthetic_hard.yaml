@@ -1,0 +1,33 @@
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.1
+  topk: 1
+  local_window: 1
+  attention_mode: full
+  topology_mode: middle_preserving_topk
+  fixed_k: 16
+  max_neighbors: 16
+  middle_bridge_width: 1
+
+training:
+  batch_size: 4
+  lr: 1.0e-3
+  max_steps: 1000
+  warmup_steps: 50
+  device: auto
+
+data:
+  path: data/synthetic_hard/train.jsonl
+  max_seq_len: 128
+
+eval:
+  interval: 50
+  metrics:
+    - route_accuracy
+    - dense_agreement
+    - hidden_l1
+    - hidden_cos
+    - logit_kl

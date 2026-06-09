@@ -67,6 +67,10 @@ class BenchmarkReport:
     sparsity_ratio: float
     relation_reduction: float
     device: str = "cpu"
+    triton_block_d: int | None = None
+    triton_block_k: int | None = None
+    effective_triton_block_d: int | None = None
+    effective_triton_block_k: int | None = None
     # Sprint 1: topology build time (CPU path, cache-miss cost)
     topology_build_ms: float = 0.0
     # Attention-only
@@ -103,7 +107,10 @@ class BenchmarkReport:
 
     def __str__(self) -> str:
         lines = [
-            f"n={self.n}  mode={self.node_mode}  k={self.k}  device={self.device}",
+            f"n={self.n}  mode={self.node_mode}  k={self.k}  device={self.device}  "
+            f"triton_block_d={self.triton_block_d}  triton_block_k={self.triton_block_k}  "
+            f"effective_triton_block_d={self.effective_triton_block_d}  "
+            f"effective_triton_block_k={self.effective_triton_block_k}",
             f"edges: full={self.full_edges}  allowed={self.allowed_edges}",
             f"avg_k={self.avg_k:.2f}  max_k={self.max_k}  padding={self.padding_ratio:.3f}",
             f"sparsity={self.sparsity_ratio:.4f}  rel_reduce={self.relation_reduction:.4f}",
@@ -282,6 +289,9 @@ def run_benchmark(
     profile_prepared_block: bool = False,
     learned_scorer_checkpoint: str | None = None,
     learned_k: int = 8,
+    triton_block_d: int | None = None,
+    triton_block_k: int | None = None,
+    benchmark_seed: int | None = None,
 ) -> BenchmarkReport:
     from .model import MathRoutedTransformer, MathRoutedTransformerBlock
     from .topology import TopologyBuilder
@@ -304,6 +314,13 @@ def run_benchmark(
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for neighbor-sparse attention")
     device = "cuda"
+
+    def _reset_benchmark_rng() -> None:
+        if benchmark_seed is None:
+            return
+        torch.manual_seed(benchmark_seed)
+        torch.cuda.manual_seed_all(benchmark_seed)
+        np.random.seed(benchmark_seed)
 
     if exprs is None:
         exprs = [
@@ -414,7 +431,10 @@ def run_benchmark(
     valid_candidate = valid_candidate.to(device)
 
     # ── Attention-only ────────────────────────────────────────────────────────
+    _reset_benchmark_rng()
     B, H, Dh = 1, n_heads, d_model // n_heads
+    effective_triton_block_d = triton_block_d if triton_block_d is not None else 1 << (Dh - 1).bit_length()
+    effective_triton_block_k = triton_block_k if triton_block_k is not None else 1 << (max(trunc_k, 1) - 1).bit_length()
     q_ = torch.randn(B, H, n, Dh, device=device)
     k_ = torch.randn(B, H, n, Dh, device=device)
     v_ = torch.randn(B, H, n, Dh, device=device)
@@ -422,8 +442,8 @@ def run_benchmark(
 
     dense_full_attn_ms   = _timed(lambda: math_attention(q_, k_, v_, None), n_warmup, n_iter)
     dense_masked_attn_ms = _timed(lambda: math_attention(q_, k_, v_, mask_4d), n_warmup, n_iter)
-    nbr_exact_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_exact, valid_exact), n_warmup, n_iter)
-    nbr_trunc_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc), n_warmup, n_iter)
+    nbr_exact_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_exact, valid_exact, block_d=triton_block_d, block_k=triton_block_k), n_warmup, n_iter)
+    nbr_trunc_ms = _timed(lambda: triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc, block_d=triton_block_d, block_k=triton_block_k), n_warmup, n_iter)
     compiled_ms = 0.0
     triton_ms = nbr_trunc_ms
 
@@ -457,7 +477,7 @@ def run_benchmark(
     _nb_stk = _nb_stk.to(device)
     _valid_stk = _valid_stk.to(device)
     scored_topk_attn_ms = _timed(
-        lambda: triton_neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk),
+        lambda: triton_neighbor_attention(q_, k_, v_, _nb_stk, _valid_stk, block_d=triton_block_d, block_k=triton_block_k),
         n_warmup, n_iter,
     )
 
@@ -466,7 +486,7 @@ def run_benchmark(
 
     def _attn_for_selector(selector: str) -> torch.Tensor:
         if selector == "topology_only":
-            return triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc)
+            return triton_neighbor_attention(q_, k_, v_, nb_trunc, valid_trunc, block_d=triton_block_d, block_k=triton_block_k)
         if selector == "kmip_only":
             nb_sel, valid_sel = neighbors_from_qk_scores(q_, k_, trunc_k)
         elif selector == "symbolic_kmip":
@@ -488,7 +508,7 @@ def run_benchmark(
             )
         else:
             raise ValueError(f"unknown selector: {selector}")
-        return triton_neighbor_attention(q_, k_, v_, nb_sel, valid_sel)
+        return triton_neighbor_attention(q_, k_, v_, nb_sel, valid_sel, block_d=triton_block_d, block_k=triton_block_k)
 
     with torch.no_grad():
         dense_ref = math_attention(q_, k_, v_, None)
@@ -525,6 +545,7 @@ def run_benchmark(
         return block
 
     # ── Block-level ───────────────────────────────────────────────────────────
+    _reset_benchmark_rng()
     proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
     with torch.no_grad():
         x_dm = proj(z_t.to(device).unsqueeze(0))  # (1, T, d_model)
@@ -545,6 +566,8 @@ def run_benchmark(
         topology_mode=topology_mode,
         fixed_k=fixed_k,
         middle_bridge_width=middle_bridge_width,
+        triton_block_d=triton_block_d,
+        triton_block_k=triton_block_k,
     ).to(device)
     _install_learned_topology(block_sparse_uc)
     # Cached sparse block — shared cache across calls
@@ -556,6 +579,8 @@ def run_benchmark(
         topology_mode=topology_mode,
         fixed_k=fixed_k,
         middle_bridge_width=middle_bridge_width,
+        triton_block_d=triton_block_d,
+        triton_block_k=triton_block_k,
     ).to(device)
     _install_learned_topology(block_sparse_c)
     # Warm the cache with one call before benchmarking
@@ -579,6 +604,8 @@ def run_benchmark(
             topology_mode=topology_mode,
             fixed_k=fixed_k,
             middle_bridge_width=middle_bridge_width,
+            triton_block_d=triton_block_d,
+            triton_block_k=triton_block_k,
         ).to(device)
         _install_learned_topology(block_prepared)
         block_prepared.eval()
@@ -621,6 +648,8 @@ def run_benchmark(
             selector_alpha=selector_alpha,
             selector_beta=selector_beta,
             selector_k=trunc_k if selector == "symbolic_candidate_kmip" else None,
+            triton_block_d=triton_block_d,
+            triton_block_k=triton_block_k,
         ).to(device)
         _install_learned_topology(block_selector)
         with torch.no_grad():
@@ -639,7 +668,8 @@ def run_benchmark(
     kw = dict(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
               topk=topk, local_window=local_window, max_neighbors=max_neighbors,
               topology_mode=topology_mode, fixed_k=fixed_k,
-              middle_bridge_width=middle_bridge_width)
+              middle_bridge_width=middle_bridge_width,
+              triton_block_d=triton_block_d, triton_block_k=triton_block_k)
     m_full   = MathRoutedTransformer(**kw, attention_mode="full",    share_topology_cache=False).to(device)
     m_masked = MathRoutedTransformer(**kw, attention_mode="dense_masked", share_topology_cache=False).to(device)
     m_sparse_uc = MathRoutedTransformer(**kw, attention_mode="neighbor_sparse", share_topology_cache=False).to(device)
@@ -676,6 +706,10 @@ def run_benchmark(
         sparsity_ratio=diag.sparsity_ratio,
         relation_reduction=diag.relation_reduction,
         device=device,
+        triton_block_d=triton_block_d,
+        triton_block_k=triton_block_k,
+        effective_triton_block_d=effective_triton_block_d,
+        effective_triton_block_k=effective_triton_block_k,
         topology_build_ms=topology_build_ms,
         dense_full_attn_ms=dense_full_attn_ms,
         dense_masked_attn_ms=dense_masked_attn_ms,
@@ -965,7 +999,7 @@ def retrieval_recall_at_k(
 
 def _print_table_header() -> None:
     cols = (
-        f"{'n':>5}  {'mode':>5}  {'allowed':>8}  {'full':>6}  "
+        f"{'n':>5}  {'mode':>5}  {'tb_d':>5}  {'tb_k':>5}  {'eff_k':>5}  {'allowed':>8}  {'full':>6}  "
         f"{'avg_k':>6}  {'max_k':>5}  {'rel_red':>7}  "
         f"{'topo_ms':>8}  "
         f"{'d_attn':>7}  {'s_trnc':>7}  {'s_comp':>7}  {'s_tri':>7}  "
@@ -979,7 +1013,7 @@ def _print_table_header() -> None:
 
 def _print_row(r: BenchmarkReport) -> None:
     print(
-        f"{r.n:>5}  {r.node_mode:>5}  {r.allowed_edges:>8}  {r.full_edges:>6}  "
+        f"{r.n:>5}  {r.node_mode:>5}  {str(r.triton_block_d):>5}  {str(r.triton_block_k):>5}  {str(r.effective_triton_block_k):>5}  {r.allowed_edges:>8}  {r.full_edges:>6}  "
         f"{r.avg_k:>6.1f}  {r.max_k:>5}  {r.relation_reduction:>7.4f}  "
         f"{r.topology_build_ms:>8.3f}  "
         f"{r.dense_full_attn_ms:>7.3f}  {r.nbr_sparse_trunc_ms:>7.3f}  "
@@ -1041,6 +1075,9 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
                 profile_prepared_block=args.profile_prepared_block,
                 learned_scorer_checkpoint=args.learned_scorer_checkpoint,
                 learned_k=args.learned_k,
+                triton_block_d=args.triton_block_d,
+                triton_block_k=args.triton_block_k,
+                benchmark_seed=args.benchmark_seed,
             )
             _print_row(r)
 
@@ -1108,6 +1145,9 @@ def main() -> None:
     parser.add_argument("--relation-weights-json", default=None, dest="relation_weights_json")
     parser.add_argument("--learned-scorer-checkpoint", default=None, dest="learned_scorer_checkpoint")
     parser.add_argument("--learned-k", type=int, default=8, dest="learned_k")
+    parser.add_argument("--triton-block-d", type=int, default=None, dest="triton_block_d")
+    parser.add_argument("--triton-block-k", type=int, default=None, dest="triton_block_k")
+    parser.add_argument("--benchmark-seed", type=int, default=None, dest="benchmark_seed")
     parser.add_argument("--save-dir", default=None, dest="save_dir")
     args = parser.parse_args()
     if args.benchmark:

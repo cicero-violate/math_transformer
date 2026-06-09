@@ -24,6 +24,7 @@ Thumbs.db
 
 # === Logs ===
 *.log
+*.nvimlog
 agent_logs/capability/
 
 # === Temporary / Backup ===
@@ -65,8 +66,12 @@ reconstructed_output/
 node_modules/
 
 # === Python (if using tooling) ===
+.venv*/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # === Debug Dumps ===
 *.ll
@@ -170,3 +175,19 @@ target/validation-*.status
 **/state/**/*.json
 **/.repo-agent-runtime/*.json
 **/.repo-agent-runtime/*.ndjson
+
+# === Math transformer generated artifacts ===
+*.aux
+runs/**
+!runs/
+!runs/.gitkeep
+!runs/benchmarks/
+!runs/benchmarks/.gitkeep
+!runs/eval_reports/
+!runs/eval_reports/.gitkeep
+!runs/failure_sets/
+!runs/failure_sets/.gitkeep
+!runs/model_checkpoints/
+!runs/model_checkpoints/.gitkeep
+!runs/topology_cache/
+!runs/topology_cache/.gitkeep
