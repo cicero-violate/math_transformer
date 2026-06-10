@@ -10,7 +10,7 @@ else
   PYTHON="python"
 fi
 
-SCORER="${SCORER:-runs/checkpoints/scorer_runtime_j_best.pt}"
+SCORER="${SCORER:-runs/checkpoints/topology_scorer.champion.pt}"
 CHECKPOINT="${CHECKPOINT:-runs/checkpoints/synthetic_hard_dense.pt}"
 EXAMPLES="${EXAMPLES:-data/synthetic_hard/val.jsonl}"
 HAND_K="${HAND_K:-16}"
@@ -38,6 +38,7 @@ BLOCK_TOKEN_CAP="${BLOCK_TOKEN_CAP:-16}"
 BLOCK_TOKEN_CAP_SWEEP="${BLOCK_TOKEN_CAP_SWEEP:-}"
 NATIVE_BLOCK_SPARSE="${NATIVE_BLOCK_SPARSE:-0}"
 TMP_DIR="${TMP_DIR:-runs/benchmarks/learned_topology_tmp}"
+TRACE_OUTPUT="${TRACE_OUTPUT:-}"
 mkdir -p "$TMP_DIR"
 
 if [[ -n "$BLOCK_TOKEN_CAP_SWEEP" ]]; then
@@ -169,10 +170,15 @@ learned_dir="$TMP_DIR/learned"
 rm -rf "$hand_dir" "$learned_dir"
 mkdir -p "$hand_dir" "$learned_dir"
 
+TRACE_ARGS=()
+if [[ -n "$TRACE_OUTPUT" ]]; then
+  TRACE_ARGS+=(--trace-output "$TRACE_OUTPUT")
+fi
+
 "$PYTHON" -m src.eval --quality --examples "$EXAMPLES" --checkpoint "$CHECKPOINT" \
   --topology-mode middle_preserving_topk --fixed-k "$HAND_K" --middle-bridge-width 1 \
   --quality-k "$HAND_K" --quality-device "$DEVICE" \
-  --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" "${TOPOLOGY_ARGS[@]}" | tee "$quality_log"
+  --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" "${TOPOLOGY_ARGS[@]}" "${TRACE_ARGS[@]}" | tee "$quality_log"
 
 "$PYTHON" -m src.eval --paired-learned-topology-benchmark --sizes "$BENCH_N" \
   --node-mode "$BENCH_NODE_MODE" --examples "$EXAMPLES" \

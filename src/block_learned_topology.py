@@ -46,6 +46,7 @@ class HeuristicBlockTopologyBuilder:
         middle_bridge_width: int = 1,
         device: torch.device | str | None = None,
         lambda_distance: float = 0.08,
+        prepare_mode: str = "full",
     ) -> None:
         self.config = BlockTopologyConfig(
             block_size=int(block_size),
@@ -60,6 +61,9 @@ class HeuristicBlockTopologyBuilder:
         self.local_window = int(local_window)
         self.middle_bridge_width = int(middle_bridge_width)
         self.lambda_distance = float(lambda_distance)
+        if prepare_mode not in {"full", "native_block_only"}:
+            raise ValueError(f"unsupported prepare_mode={prepare_mode!r}")
+        self.prepare_mode = prepare_mode
         self._requested_device = torch.device(device) if device is not None else None
         self.last_timing: dict[str, float] = {}
 
@@ -160,12 +164,9 @@ class HeuristicBlockTopologyBuilder:
         mid = n // 2 if n else 0
 
         _sync_if_cuda(dev); t2 = time.perf_counter()
-        # Build the token table on CPU using Python lists, then transfer once.
-        # This avoids thousands of tiny CUDA tensor writes and removes the
-        # previous O(N^2) child lookup inside symbolic bridge expansion.
-        node_to_first_index: dict[MathNode, int] = {}
-        for idx, nd in enumerate(nodes):
-            node_to_first_index.setdefault(nd, idx)
+        # Build the block-token table on CPU using Python lists, then transfer
+        # once. Native block-sparse attention consumes this table directly and
+        # does not require the full per-token neighbor table.
         block_neighbors_cpu = block_neighbors.detach().cpu().tolist()
         block_valid_cpu = block_valid_i8.detach().cpu().numpy().astype(np.int8)
         kb_eff = int(block_neighbors.shape[1])
@@ -188,58 +189,72 @@ class HeuristicBlockTopologyBuilder:
                 if cand:
                     block_token_indices_cpu[bi, slot, :len(cand)] = cand
                     block_token_valid_cpu[bi, slot, :len(cand)] = 1
-        neighbors_cpu = np.zeros((n, K), dtype=np.int64)
-        valid_cpu = np.zeros((n, K), dtype=np.int8)
-        for t in range(n):
-            vals: list[int] = []
-            seen: set[int] = set()
-
-            def add(u: int) -> None:
-                if 0 <= u < n and u not in seen and len(vals) < K:
-                    seen.add(u)
-                    vals.append(u)
-
-            add(t)
-            for u in range(t - local, t + local + 1):
-                add(u)
-            if self.config.include_symbolic_bridge:
-                for child in nodes[t].args:
-                    j = node_to_first_index.get(child)
-                    if j is not None:
-                        add(j)
-                if self.middle_bridge_width > 0:
-                    for u in range(mid - self.middle_bridge_width, mid + self.middle_bridge_width + 1):
-                        add(u)
-            b = t // bs
-            for bj in block_neighbors_cpu[b]:
-                start = int(bj) * bs
-                end = min(start + bs, n)
-                if end <= start:
-                    continue
-                if cap >= (end - start):
-                    cand = range(start, end)
-                else:
-                    step = max(1, (end - start) // cap)
-                    cand = range(start, end, step)
-                for u in cand:
-                    add(int(u))
-                    if len(vals) >= K:
-                        break
-                if len(vals) >= K:
-                    break
-            if vals:
-                neighbors_cpu[t, :len(vals)] = vals
-                valid_cpu[t, :len(vals)] = 1
-        neighbors = torch.from_numpy(neighbors_cpu).to(dev, non_blocking=True)
-        valid = torch.from_numpy(valid_cpu).to(dev, non_blocking=True)
         block_token_indices = torch.from_numpy(block_token_indices_cpu).to(dev, non_blocking=True)
         block_token_valid_i8 = torch.from_numpy(block_token_valid_cpu).to(dev, non_blocking=True)
-        _sync_if_cuda(dev); t3 = time.perf_counter()
 
-        per_row = valid_cpu.sum(axis=1) if n else np.array([], dtype=np.int64)
-        allowed = int(per_row.sum()) if n else 0
-        max_k = int(per_row.max()) if n else 0
-        avg_k = float(per_row.mean()) if n else 0.0
+        neighbors: torch.Tensor | None = None
+        valid: torch.Tensor | None = None
+        allowed = int(block_token_valid_cpu.sum()) if n else 0
+        max_k = int(block_token_valid_cpu.sum(axis=(1, 2)).max()) if block_token_valid_cpu.size else 0
+        avg_k = float(block_token_valid_cpu.sum(axis=(1, 2)).mean()) if block_token_valid_cpu.size else 0.0
+        neighbor_table_build_ms = 0.0
+
+        if self.prepare_mode != "native_block_only":
+            _sync_if_cuda(dev); nt0 = time.perf_counter()
+            node_to_first_index: dict[MathNode, int] = {}
+            for idx, nd in enumerate(nodes):
+                node_to_first_index.setdefault(nd, idx)
+            neighbors_cpu = np.zeros((n, K), dtype=np.int64)
+            valid_cpu = np.zeros((n, K), dtype=np.int8)
+            for t in range(n):
+                vals: list[int] = []
+                seen: set[int] = set()
+
+                def add(u: int) -> None:
+                    if 0 <= u < n and u not in seen and len(vals) < K:
+                        seen.add(u)
+                        vals.append(u)
+
+                add(t)
+                for u in range(t - local, t + local + 1):
+                    add(u)
+                if self.config.include_symbolic_bridge:
+                    for child in nodes[t].args:
+                        j = node_to_first_index.get(child)
+                        if j is not None:
+                            add(j)
+                    if self.middle_bridge_width > 0:
+                        for u in range(mid - self.middle_bridge_width, mid + self.middle_bridge_width + 1):
+                            add(u)
+                b = t // bs
+                for bj in block_neighbors_cpu[b]:
+                    start = int(bj) * bs
+                    end = min(start + bs, n)
+                    if end <= start:
+                        continue
+                    if cap >= (end - start):
+                        cand = range(start, end)
+                    else:
+                        step = max(1, (end - start) // cap)
+                        cand = range(start, end, step)
+                    for u in cand:
+                        add(int(u))
+                        if len(vals) >= K:
+                            break
+                    if len(vals) >= K:
+                        break
+                if vals:
+                    neighbors_cpu[t, :len(vals)] = vals
+                    valid_cpu[t, :len(vals)] = 1
+            neighbors = torch.from_numpy(neighbors_cpu).to(dev, non_blocking=True)
+            valid = torch.from_numpy(valid_cpu).to(dev, non_blocking=True)
+            per_row = valid_cpu.sum(axis=1) if n else np.array([], dtype=np.int64)
+            allowed = int(per_row.sum()) if n else 0
+            max_k = int(per_row.max()) if n else 0
+            avg_k = float(per_row.mean()) if n else 0.0
+            _sync_if_cuda(dev); nt1 = time.perf_counter()
+            neighbor_table_build_ms = (nt1 - nt0) * 1000.0
+        _sync_if_cuda(dev); t3 = time.perf_counter()
         full = n * n
         diag = MaskDiagnostics(
             n=n,
@@ -256,12 +271,14 @@ class HeuristicBlockTopologyBuilder:
                 "block_count": int(block_neighbors.shape[0]),
                 "block_token_cap": int(cap),
                 "block_effective_token_k": int(block_neighbors.shape[1] * cap),
+                "prepare_mode_native_block_only": int(self.prepare_mode == "native_block_only"),
             },
         )
         self.last_timing = {
             "topology_prepare_ms": (t3 - t0) * 1000.0,
             "learned_scorer_ms": (t1 - t0) * 1000.0,
-            "neighbor_table_build_ms": (t3 - t2) * 1000.0,
+            "neighbor_table_build_ms": neighbor_table_build_ms,
+            "block_token_table_build_ms": (t3 - t2 - neighbor_table_build_ms / 1000.0) * 1000.0,
         }
         return PreparedBlockTopology(
             block_neighbors=block_neighbors,

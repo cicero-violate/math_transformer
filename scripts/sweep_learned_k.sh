@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SCORER="${SCORER:-runs/checkpoints/scorer_runtime_aligned.runtime_best.pt}"
+SCORER="${SCORER:-runs/checkpoints/topology_scorer.champion.pt}"
 HAND_K="${HAND_K:-16}"
 DEVICE="${DEVICE:-auto}"
 BENCH_STEPS="${BENCH_STEPS:-100}"

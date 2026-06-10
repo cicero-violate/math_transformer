@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from src.eval_topology_scorer import evaluate_topology_scorer
@@ -23,6 +24,7 @@ def test_evaluate_topology_scorer_smoke(tmp_path: Path):
         device="cpu",
         log_interval=2,
     )
+    trace_path = tmp_path / "topology_traces.jsonl"
     summary = evaluate_topology_scorer(
         examples_path=str(data),
         checkpoint=str(ckpt),
@@ -30,9 +32,18 @@ def test_evaluate_topology_scorer_smoke(tmp_path: Path):
         target_k=4,
         device="cpu",
         max_examples=5,
+        trace_output=str(trace_path),
     )
 
     assert summary["examples"] == 5
+    assert summary["trace_output"] == str(trace_path)
+    rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert len(rows) == 5
+    assert rows[0]["feature_schema"] == "topology_edge_features.v1"
+    assert rows[0]["features"]["shape"][-1] == 10
+    assert "scores" in rows[0]
+    assert "pred_topology" in rows[0]
+    assert "overlap" in rows[0]
     assert 0.0 <= float(summary["mean_row_recall"]) <= 1.0
     assert 0.0 <= float(summary["mean_row_precision"]) <= 1.0
     assert summary["row_cap_violations"] == 0

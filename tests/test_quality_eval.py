@@ -53,3 +53,34 @@ def test_run_quality_eval_reports_full_and_sparse_k_values():
     assert "by_expert" in str(reports[0])
     assert "hidden_l1" in str(reports[1])
     assert "logit_kl" in str(reports[1])
+
+
+def test_run_quality_eval_writes_trace_without_learned_scorer(tmp_path):
+    import json
+
+    trace_path = tmp_path / "quality_trace.jsonl"
+    reports = run_quality_eval(
+        examples_path=str(PROJ / "data" / "examples.jsonl"),
+        k_values=[2],
+        d_model=16,
+        n_heads=2,
+        n_layers=1,
+        d_ff=32,
+        topk=1,
+        local_window=1,
+        device="cpu",
+        topology_mode="middle_preserving_topk",
+        fixed_k=4,
+        middle_bridge_width=1,
+        trace_output=str(trace_path),
+    )
+
+    assert [r.mode for r in reports] == ["full", "topology_only"]
+    rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert rows
+    first = rows[0]
+    assert first["feature_schema"] == "topology_edge_features.v1"
+    assert first["scorer_checkpoint"] is None
+    assert first["target_topology"]["active_edges"] > 0
+    assert first["prediction"]["dense_pred_id"] >= 0
+    assert first["diagnostics"]["trace_source"] == "run_quality_eval"

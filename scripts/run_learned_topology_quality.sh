@@ -13,19 +13,26 @@ fi
 OUT_DIR="${OUT_DIR:-data/synthetic_hard}"
 EXAMPLES="${EXAMPLES:-$OUT_DIR/val.jsonl}"
 CHECKPOINT="${CHECKPOINT:-runs/checkpoints/synthetic_hard_dense.pt}"
-SCORER="${SCORER:-runs/checkpoints/learned_topology_scorer.best.pt}"
+SCORER="${SCORER:-runs/checkpoints/topology_scorer.champion.pt}"
 LEARNED_K="${LEARNED_K:-8}"
 QUALITY_K="${QUALITY_K:-16}"
 DEVICE="${DEVICE:-auto}"
+TRACE_OUTPUT="${TRACE_OUTPUT:-}"
 
-"$PYTHON" -m src.eval \
-  --quality \
-  --examples "$EXAMPLES" \
-  --checkpoint "$CHECKPOINT" \
-  --topology-mode middle_preserving_topk \
-  --fixed-k 16 \
-  --middle-bridge-width 1 \
-  --quality-k "$QUALITY_K" \
-  --quality-device "$DEVICE" \
-  --learned-scorer-checkpoint "$SCORER" \
-  --learned-k "$LEARNED_K"
+CMD=("$PYTHON" -m src.eval
+  --quality
+  --examples "$EXAMPLES"
+  --checkpoint "$CHECKPOINT"
+  --topology-mode middle_preserving_topk
+  --fixed-k 16
+  --middle-bridge-width 1
+  --quality-k "$QUALITY_K"
+  --quality-device "$DEVICE"
+  --learned-scorer-checkpoint "$SCORER"
+  --learned-k "$LEARNED_K")
+
+if [[ -n "$TRACE_OUTPUT" ]]; then
+  CMD+=(--trace-output "$TRACE_OUTPUT")
+fi
+
+"${CMD[@]}"

@@ -307,6 +307,16 @@ def run_benchmark(
     from .topology import TopologyBuilder
     from .learned_topology_runtime import LearnedTopologyBuilder
     from .block_learned_topology import HeuristicBlockTopologyBuilder
+    from .embedder import MathEmbedder
+    from .learned_topology import FEATURE_NAMES, topk_mask_from_scores
+    from .topology import TopologyBuilder
+    from .topology_trace import (
+        TopologyTraceWriter,
+        hash_nodes,
+        summarize_mask,
+        summarize_overlap,
+        summarize_scores,
+    )
     from .topology_cache import TopologyCache, CachedTopology
     from .embedder import MathEmbedder
     from .sparse_attention import (
@@ -872,6 +882,7 @@ def run_paired_learned_topology_benchmark(
             local_window=local_window,
             middle_bridge_width=middle_bridge_width,
             device=device,
+            prepare_mode="native_block_only" if native_block_sparse_attn else "full",
         )
     else:
         learned_builder = LearnedTopologyBuilder(
@@ -970,10 +981,16 @@ def run_paired_learned_topology_benchmark(
         triton_block_d: int | None,
         triton_block_k: int | None,
     ) -> None:
-        block_obj.max_neighbors = prepared.k
+        block_obj.max_neighbors = learned_k if prepared.neighbors is None else prepared.k
         block_obj._prepared_topology = prepared
-        block_obj.static_neighbors = prepared.neighbors.to(device).contiguous()
-        block_obj.static_valid_i8 = prepared.valid_i8.to(device).contiguous()
+        block_obj.static_neighbors = (
+            torch.empty(0, 0, dtype=torch.long, device=device)
+            if prepared.neighbors is None else prepared.neighbors.to(device).contiguous()
+        )
+        block_obj.static_valid_i8 = (
+            torch.empty(0, 0, dtype=torch.int8, device=device)
+            if prepared.valid_i8 is None else prepared.valid_i8.to(device).contiguous()
+        )
         block_obj.static_block_neighbors = (
             torch.empty(0, 0, dtype=torch.long, device=device)
             if prepared.block_neighbors is None else prepared.block_neighbors.to(device).contiguous()
@@ -1098,7 +1115,7 @@ def run_paired_learned_topology_benchmark(
             triton_block_d=triton_block_d,
             triton_block_k=triton_block_k,
             effective_triton_block_d=_effective_block_d(triton_block_d, d_model // n_heads),
-            effective_triton_block_k=_effective_block_k(triton_block_k, prepared.k),
+            effective_triton_block_k=_effective_block_k(triton_block_k, learned_k if prepared.k == 0 else prepared.k),
             triton_sparse_attn_ms=attn,
             sparse_block_cached_ms=total,
             prepared_static_sparse_block_ms=total,
@@ -1145,12 +1162,23 @@ def run_quality_eval(
     topk_blocks: int = 4,
     block_local_window: int = 1,
     block_token_cap: int = 16,
+    trace_output: str | None = None,
 ) -> list[QualityReport]:
     from .model import MathRoutedTransformer
     from .parser import parse
     from .normalize import normalize
     from .learned_topology_runtime import LearnedTopologyBuilder
     from .block_learned_topology import HeuristicBlockTopologyBuilder
+    from .embedder import MathEmbedder
+    from .learned_topology import FEATURE_NAMES, topk_mask_from_scores
+    from .topology import TopologyBuilder
+    from .topology_trace import (
+        TopologyTraceWriter,
+        hash_nodes,
+        summarize_mask,
+        summarize_overlap,
+        summarize_scores,
+    )
 
     records = _load_route_eval_records(examples_path)
     if not records:
@@ -1393,6 +1421,106 @@ def run_quality_eval(
             )
         )
 
+
+    if trace_output:
+        trace_builder = None
+        if learned_scorer_checkpoint:
+            trace_builder = LearnedTopologyBuilder(
+                learned_scorer_checkpoint,
+                fixed_k=learned_k,
+                topk=topk,
+                local_window=local_window,
+                middle_bridge_width=middle_bridge_width,
+                device=dev,
+            )
+        hand_builder = TopologyBuilder(
+            topk=topk,
+            local_window=local_window,
+            topology_mode="middle_preserving_topk" if topology_mode == "learned_block_topk" else topology_mode,
+            fixed_k=fixed_k,
+            middle_bridge_width=middle_bridge_width,
+            relation_weights=relation_weights,
+        )
+        embedder = MathEmbedder()
+        with TopologyTraceWriter(trace_output) as writer:
+            for sample_idx, rec in enumerate(records):
+                root = normalize(parse(rec["expr"]))
+                nodes = root.collect_nodes()
+                env = rec["env"] or None
+                z = embedder.encode_batch(nodes)
+                hand_mask_np, _ = hand_builder.build_scored_topk(nodes, z, env)
+                hand_mask = torch.as_tensor(hand_mask_np, dtype=torch.bool)
+                learned_mask = None
+                learned_scores = None
+                if trace_builder is not None:
+                    learned_scores = trace_builder._scores(nodes, z, env, dev)  # compact trace path only
+                    learned_mask = topk_mask_from_scores(learned_scores, learned_k)
+                prediction: dict[str, object] = {
+                    "target_expert": rec.get("expert"),
+                    "target_expert_id": rec.get("expert_id"),
+                    "dense_pred_id": dense_preds[sample_idx],
+                    "dense_correct": dense_preds[sample_idx] == targets[sample_idx],
+                }
+                if k_values:
+                    # The first topology_only row is the normal hand/sparse comparison used by quality eval.
+                    # Additional k rows remain available in aggregate reports.
+                    pass
+                if learned_scorer_checkpoint:
+                    prediction.update({
+                        "learned_pred_id": learned_preds[sample_idx],
+                        "learned_correct": learned_preds[sample_idx] == targets[sample_idx],
+                        "learned_dense_agree": learned_preds[sample_idx] == dense_preds[sample_idx],
+                    })
+                    hidden_l1 = float((learned_hiddens[sample_idx] - dense_hiddens[sample_idx]).abs().mean().item())
+                    hidden_cos = float(torch.nn.functional.cosine_similarity(
+                        learned_hiddens[sample_idx].reshape(1, -1),
+                        dense_hiddens[sample_idx].reshape(1, -1),
+                        dim=1,
+                    ).item())
+                    logit_l1 = float((learned_logits[sample_idx] - dense_logits[sample_idx]).abs().mean().item())
+                    logit_kl = float(torch.nn.functional.kl_div(
+                        torch.nn.functional.log_softmax(learned_logits[sample_idx], dim=-1),
+                        torch.nn.functional.softmax(dense_logits[sample_idx], dim=-1),
+                        reduction="batchmean",
+                    ).item())
+                else:
+                    hidden_l1 = hidden_cos = logit_l1 = logit_kl = None
+                writer.write({
+                    "sample_id": sample_idx,
+                    "domain": "math",
+                    "expr": rec.get("expr"),
+                    "nodes_hash": hash_nodes(nodes),
+                    "n": len(nodes),
+                    "k": learned_k if learned_scorer_checkpoint else fixed_k,
+                    "scorer_checkpoint": learned_scorer_checkpoint,
+                    "feature_schema": "topology_edge_features.v1",
+                    "feature_names": list(FEATURE_NAMES),
+                    "topology_config": {
+                        "topology_mode": topology_mode,
+                        "fixed_k": fixed_k,
+                        "learned_k": learned_k,
+                        "topk": topk,
+                        "local_window": local_window,
+                        "middle_bridge_width": middle_bridge_width,
+                        "n_layers": n_layers,
+                    },
+                    "scores": summarize_scores(learned_scores) if learned_scores is not None else {},
+                    "target_topology": summarize_mask(hand_mask),
+                    "pred_topology": summarize_mask(learned_mask) if learned_mask is not None else {},
+                    "overlap": summarize_overlap(learned_mask, hand_mask) if learned_mask is not None else {},
+                    "prediction": prediction,
+                    "agreement": {
+                        "hidden_l1": hidden_l1,
+                        "hidden_cos": hidden_cos,
+                        "logit_l1": logit_l1,
+                        "logit_kl": logit_kl,
+                    },
+                    "diagnostics": {
+                        "trace_source": "run_quality_eval",
+                        "has_learned_topology": bool(learned_scorer_checkpoint),
+                    },
+                })
+
     return reports
 
 
@@ -1586,6 +1714,7 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
         topk_blocks=args.topk_blocks,
         block_local_window=args.block_local_window,
         block_token_cap=args.block_token_cap,
+        trace_output=args.trace_output,
     )
     print(f"examples={args.examples}  checkpoint={args.checkpoint or 'random_init'}")
     for report in reports:
@@ -1645,6 +1774,7 @@ def main() -> None:
     parser.add_argument("--hand-save-dir", default=None, dest="hand_save_dir")
     parser.add_argument("--learned-save-dir", default=None, dest="learned_save_dir")
     parser.add_argument("--save-dir", default=None, dest="save_dir")
+    parser.add_argument("--trace-output", default=None, dest="trace_output", help="Optional JSONL path for compact quality/topology traces.")
     args = parser.parse_args()
     if args.paired_learned_topology_benchmark:
         _run_paired_learned_topology_benchmark_cli(args)

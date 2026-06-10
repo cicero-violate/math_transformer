@@ -23,19 +23,23 @@ class PreparedBlockTopology:
     block_valid_i8: torch.Tensor       # (B, topk_blocks_eff), int8
     block_token_indices: torch.Tensor | None  # (B, topk_blocks_eff, C), int64 absolute token indices
     block_token_valid_i8: torch.Tensor | None # (B, topk_blocks_eff, C), int8
-    token_neighbors: torch.Tensor      # (N, K), int64
-    token_valid_i8: torch.Tensor       # (N, K), int8
+    token_neighbors: torch.Tensor | None      # (N, K), int64; optional for native block-only runtime
+    token_valid_i8: torch.Tensor | None       # (N, K), int8; optional for native block-only runtime
     diagnostics: MaskDiagnostics
     block_size: int
     is_block_topology: bool = True
 
     @property
     def length(self) -> int:
-        return int(self.token_neighbors.shape[0])
+        if self.token_neighbors is not None:
+            return int(self.token_neighbors.shape[0])
+        return int(self.diagnostics.n)
 
     @property
     def k(self) -> int:
-        return int(self.token_neighbors.shape[1])
+        if self.token_neighbors is not None:
+            return int(self.token_neighbors.shape[1])
+        return 0
 
     @property
     def num_blocks(self) -> int:
@@ -43,4 +47,6 @@ class PreparedBlockTopology:
 
     @property
     def device(self) -> torch.device:
-        return self.token_neighbors.device
+        if self.token_neighbors is not None:
+            return self.token_neighbors.device
+        return self.block_neighbors.device

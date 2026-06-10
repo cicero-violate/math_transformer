@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 
 from .eval import _load_route_eval_records, run_quality_eval
-from .dense_mix_sweep import quality_score
 from .embedder import MathEmbedder
 from .model import MathRoutedTransformer
 from .learned_topology import (
@@ -57,7 +56,7 @@ def _edge_metrics(scores: torch.Tensor, target: torch.Tensor, eval_k: int) -> di
 
 def _aggregate_metrics(
     scorer: LearnedTopologyScorer,
-    cached: list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, dict | None]],
+    cached: list[tuple],
     eval_k: int,
 ) -> dict[str, float]:
     if not cached:
@@ -125,6 +124,14 @@ def _save_scorer_checkpoint(
     dense_checkpoint: str | None = None,
     dense_mix: float = 0.0,
     resume_scorer_checkpoint: str | None = None,
+    replay_candidates_path: str | None = None,
+    replay_weight_scale: float = 0.0,
+    replay_max_weight: float = 1.0,
+    replay_weighted_examples: int = 0,
+    replay_appended_examples: int = 0,
+    replay_sample_ratio: float = 0.0,
+    replay_sampled_steps: int = 0,
+    best_selection: str = "edge_recall",
 ) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +146,14 @@ def _save_scorer_checkpoint(
         "dense_checkpoint": dense_checkpoint or "",
         "dense_mix": float(dense_mix),
         "resume_scorer_checkpoint": resume_scorer_checkpoint or "",
+        "replay_candidates_path": replay_candidates_path or "",
+        "replay_weight_scale": float(replay_weight_scale),
+        "replay_max_weight": float(replay_max_weight),
+        "replay_weighted_examples": int(replay_weighted_examples),
+        "replay_appended_examples": int(replay_appended_examples),
+        "replay_sample_ratio": float(replay_sample_ratio),
+        "replay_sampled_steps": int(replay_sampled_steps),
+        "best_selection": best_selection,
         "local_window": local_window,
         "middle_bridge_width": middle_bridge_width,
         "topology_mode": topology_mode,
@@ -347,18 +362,140 @@ def _write_runtime_subset(source_path: str, max_examples: int) -> str:
     return out.name
 
 
+def _load_replay_weights(
+    replay_candidates_path: str | None,
+    *,
+    replay_weight_scale: float = 0.1,
+    replay_max_weight: float = 8.0,
+) -> dict[str, float]:
+    """Load expression-level loss weights from replay candidate JSONL.
+
+    Replay rows are selected from standardized topology traces. They should carry
+    an `expr` and `replay_score`. Training remains unchanged when no replay file
+    is supplied. Multiple rows for the same expression keep the largest weight.
+    """
+    if not replay_candidates_path:
+        return {}
+    path = Path(replay_candidates_path)
+    if not path.exists():
+        raise FileNotFoundError(f"replay candidates file not found: {replay_candidates_path}")
+    scale = max(float(replay_weight_scale), 0.0)
+    max_weight = max(float(replay_max_weight), 1.0)
+    weights: dict[str, float] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"replay row must be an object: {path}:{line_no}")
+            expr = row.get("expr")
+            if not expr:
+                continue
+            score = float(row.get("replay_score", 1.0) or 1.0)
+            weight = min(max_weight, 1.0 + scale * max(score, 0.0))
+            weights[str(expr)] = max(weights.get(str(expr), 1.0), weight)
+    return weights
+
+
+def _canonicalize_shape_env(env):
+    """Convert JSON-loaded shape env lists into tuple shapes expected by infer_shape."""
+    if env is None:
+        return None
+    if not isinstance(env, dict):
+        return env
+    out = {}
+    for key, value in env.items():
+        if isinstance(value, list):
+            out[key] = tuple(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_replay_records(replay_candidates_path: str | None) -> list[dict]:
+    """Load replay candidate rows as route-record-like training examples.
+
+    This is separate from replay weighting. If a replay expression is not present
+    in the base training JSONL, it can still be appended to the training cache and
+    trained with its replay weight. The topology scorer target is still generated
+    from the hand/dense teacher; replay rows only choose *which expressions* get
+    extra training pressure.
+    """
+    if not replay_candidates_path:
+        return []
+    path = Path(replay_candidates_path)
+    if not path.exists():
+        raise FileNotFoundError(f"replay candidates file not found: {replay_candidates_path}")
+    records: list[dict] = []
+    seen: set[str] = set()
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"replay row must be an object: {path}:{line_no}")
+            expr = row.get("expr")
+            if not expr:
+                continue
+            expr = str(expr)
+            if expr in seen:
+                continue
+            seen.add(expr)
+            records.append({
+                "expr": expr,
+                "env": _canonicalize_shape_env(row.get("env") or None),
+                "expert": row.get("target_expert") or "",
+                "expert_id": row.get("target_expert_id", -1),
+                "source": "replay_candidate",
+            })
+    return records
+
+
 def _quality_report_to_score_row(report) -> dict[str, float | int | str | None]:
+    by_expert = getattr(report, "by_expert", None) or {}
+    generic = by_expert.get("generic_expert", {}) if isinstance(by_expert, dict) else {}
+    generic_correct = int(generic.get("correct", 0) or 0) if isinstance(generic, dict) else 0
+    generic_total = int(generic.get("total", 0) or 0) if isinstance(generic, dict) else 0
+    generic_acc = float(generic.get("accuracy", 0.0) or 0.0) if isinstance(generic, dict) else 0.0
     return {
         "mode": report.mode,
         "k": str(report.k if report.k is not None else "full"),
         "examples": report.n_examples,
         "route_acc": report.route_accuracy,
+        "generic_acc": generic_acc,
+        "generic_correct": generic_correct,
+        "generic_total": generic_total,
         "dense_agree": report.dense_agreement,
         "hidden_l1": report.hidden_l1,
         "hidden_cos": report.hidden_cos,
         "logit_l1": report.logit_l1,
         "logit_kl": report.logit_kl_dense_to_sparse,
     }
+
+
+def _runtime_quality_selection_score(row: dict[str, float | int | str | None]) -> float:
+    """Route-first/generic-aware runtime checkpoint score.
+
+    This intentionally makes route accuracy dominate representation metrics.
+    Generic-expert accuracy is second because current learned-topology failures
+    are concentrated there. Dense/hidden/logit agreement only break quality ties.
+    """
+    route = float(row.get("route_acc") or 0.0)
+    generic = float(row.get("generic_acc") or 0.0)
+    dense_agree = float(row.get("dense_agree") or 0.0)
+    hidden_cos = float(row.get("hidden_cos") or 0.0)
+    logit_kl = float(row.get("logit_kl") or 0.0)
+    return (
+        1_000_000.0 * route
+        + 10_000.0 * generic
+        + 100.0 * dense_agree
+        + hidden_cos
+        - logit_kl
+    )
 
 
 def _runtime_quality_score_for_checkpoint(
@@ -389,7 +526,10 @@ def _runtime_quality_score_for_checkpoint(
         if not learned:
             raise RuntimeError("runtime quality eval produced no learned_topology report")
         row = _quality_report_to_score_row(learned[-1])
-        return quality_score(row), row
+        # Keep checkpoint selection route-first. The older quality_score helper is
+        # intentionally not used here because it can prefer lower KL despite lower
+        # route accuracy.
+        return _runtime_quality_selection_score(row), row
     finally:
         if max_examples > 0 and eval_examples != examples_path:
             try:
@@ -450,18 +590,47 @@ def train_topology_scorer(
     runtime_kl_loss: float = 0.0,
     runtime_cos_loss: float = 0.0,
     runtime_hidden_l1_loss: float = 0.0,
+    replay_candidates_path: str | None = None,
+    replay_weight_scale: float = 0.1,
+    replay_max_weight: float = 8.0,
+    replay_sample_ratio: float = 0.0,
+    best_selection: str = "edge_recall",
 ) -> dict[str, float | int | str]:
     if not Path(examples_path).exists():
         raise FileNotFoundError(f"examples file not found: {examples_path}")
     torch.manual_seed(seed)
     np.random.seed(seed)
     dev = _resolve_device(device)
+    best_selection = str(best_selection)
+    if best_selection not in {"edge_recall", "runtime_quality"}:
+        raise ValueError("best_selection must be 'edge_recall' or 'runtime_quality'")
+    runtime_quality_enabled = bool(runtime_quality_examples_path and runtime_quality_checkpoint and runtime_quality_interval > 0)
+    if best_selection == "runtime_quality" and not runtime_quality_enabled:
+        raise ValueError("best_selection='runtime_quality' requires runtime quality examples, checkpoint, and interval")
 
     records = _load_route_eval_records(examples_path)
     if max_examples and max_examples > 0:
         records = records[:max_examples]
     if not records:
         raise ValueError(f"no route examples loaded from {examples_path}")
+
+    replay_weights = _load_replay_weights(
+        replay_candidates_path,
+        replay_weight_scale=replay_weight_scale,
+        replay_max_weight=replay_max_weight,
+    )
+    replay_records = _load_replay_records(replay_candidates_path)
+    base_exprs = {str(rec.get("expr", "")) for rec in records}
+    replay_appended_examples = 0
+    replay_sample_ratio = float(max(0.0, min(1.0, replay_sample_ratio)))
+    for replay_rec in replay_records:
+        replay_expr = str(replay_rec.get("expr", ""))
+        if not replay_expr or replay_expr in base_exprs:
+            continue
+        records.append(replay_rec)
+        base_exprs.add(replay_expr)
+        replay_appended_examples += 1
+    replay_weighted_examples = 0
 
     embedder = MathEmbedder()
     teacher = TopologyBuilder(
@@ -496,8 +665,9 @@ def train_topology_scorer(
         for param in dense_teacher.parameters():
             param.requires_grad_(False)
 
-    def _build_cached(route_records):
-        built: list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, dict | None]] = []
+    def _build_cached(route_records, *, apply_replay_weights: bool = False):
+        nonlocal replay_weighted_examples
+        built: list[tuple] = []
         for rec in route_records:
             root = normalize(parse(rec["expr"]))
             nodes = root.collect_nodes()
@@ -533,28 +703,39 @@ def train_topology_scorer(
                     "dense_hidden": dense_hidden,
                     "dense_logits": dense_logits,
                 }
-            built.append((features, target, len(nodes), _normalize_teacher_scores(teacher_score), runtime_payload))
+            sample_weight = float(replay_weights.get(str(rec.get("expr", "")), 1.0)) if apply_replay_weights else 1.0
+            is_replay_weighted = bool(apply_replay_weights and sample_weight > 1.0)
+            if is_replay_weighted:
+                replay_weighted_examples += 1
+            built.append((features, target, len(nodes), _normalize_teacher_scores(teacher_score), runtime_payload, sample_weight, is_replay_weighted))
         return built
 
-    cached = _build_cached(records)
+    cached = _build_cached(records, apply_replay_weights=True)
 
     if not cached:
         raise ValueError("no trainable topology examples built")
 
-    val_cached: list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, dict | None]] = []
+    val_cached: list[tuple] = []
     if val_examples_path:
         val_records = _load_route_eval_records(val_examples_path)
         if eval_max_examples and eval_max_examples > 0:
             val_records = val_records[:eval_max_examples]
-        val_cached = _build_cached(val_records)
+        val_cached = _build_cached(val_records, apply_replay_weights=False)
 
     rng = random.Random(seed)
     order = list(range(len(cached)))
     rng.shuffle(order)
+    replay_indices = [idx for idx, item in enumerate(cached) if bool(item[6])]
+    replay_sampled_steps = 0
     best_metric = -1.0
-    best_path = best_checkpoint or str(Path(save_checkpoint).with_name(Path(save_checkpoint).stem + ".best.pt"))
+    default_best_path = best_checkpoint or str(Path(save_checkpoint).with_name(Path(save_checkpoint).stem + ".best.pt"))
+    if best_selection == "runtime_quality":
+        runtime_best_path = runtime_quality_best_checkpoint or default_best_path
+        best_path = str(Path(save_checkpoint).with_name(Path(save_checkpoint).stem + ".edge_best.pt"))
+    else:
+        best_path = default_best_path
+        runtime_best_path = runtime_quality_best_checkpoint or str(Path(save_checkpoint).with_name(Path(save_checkpoint).stem + ".runtime_best.pt"))
     runtime_best_score = -1.0
-    runtime_best_path = runtime_quality_best_checkpoint or str(Path(save_checkpoint).with_name(Path(save_checkpoint).stem + ".runtime_best.pt"))
     runtime_stale_count = 0
     last_runtime_quality: dict[str, float | int | str | None] = {}
     best_runtime_quality: dict[str, float | int | str | None] = {}
@@ -569,6 +750,14 @@ def train_topology_scorer(
             examples_path=examples_path, best_metric=(best_metric if best_metric >= 0 else None),
             teacher_signal=teacher_signal, dense_checkpoint=dense_checkpoint, dense_mix=dense_mix,
             resume_scorer_checkpoint=resume_scorer_checkpoint,
+            replay_candidates_path=replay_candidates_path,
+            replay_weight_scale=replay_weight_scale,
+            replay_max_weight=replay_max_weight,
+            replay_weighted_examples=replay_weighted_examples,
+            replay_appended_examples=replay_appended_examples,
+            replay_sample_ratio=replay_sample_ratio,
+            replay_sampled_steps=replay_sampled_steps,
+            best_selection=best_selection,
         )
 
     def _maybe_update_runtime_best(step_label: str) -> None:
@@ -619,7 +808,7 @@ def train_topology_scorer(
             except OSError:
                 pass
 
-    if runtime_quality_examples_path and runtime_quality_checkpoint and runtime_quality_interval > 0:
+    if runtime_quality_enabled:
         print("         runtime quality baseline before training")
         _maybe_update_runtime_best("baseline")
 
@@ -629,7 +818,13 @@ def train_topology_scorer(
     for step in range(max_steps):
         if step > 0 and step % len(order) == 0:
             rng.shuffle(order)
-        features, target, n_nodes, teacher_score, runtime_payload = cached[order[step % len(order)]]
+        use_replay_sample = bool(replay_indices and replay_sample_ratio > 0.0 and rng.random() < replay_sample_ratio)
+        if use_replay_sample:
+            item_idx = rng.choice(replay_indices)
+            replay_sampled_steps += 1
+        else:
+            item_idx = order[step % len(order)]
+        features, target, n_nodes, teacher_score, runtime_payload, sample_weight, is_replay_weighted = cached[item_idx]
         scores = scorer(features)
         # Positives are sparse; use a per-example positive weight so identity/relations
         # are not drowned by disconnected pairs.
@@ -670,6 +865,8 @@ def train_topology_scorer(
             if runtime_hidden_l1_loss > 0.0:
                 loss = loss + runtime_hidden_l1_loss * F.l1_loss(torch.sigmoid(scores), teacher_score)
 
+        loss = loss * float(sample_weight)
+
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -678,7 +875,7 @@ def train_topology_scorer(
         if step % log_interval == 0 or step == max_steps - 1:
             last_metrics = _edge_metrics(scores.detach(), target.bool(), eval_k)
             print(
-                f"step={step:5d} loss={last_loss:.6f} n={n_nodes:3d} "
+                f"step={step:5d} loss={last_loss:.6f} n={n_nodes:3d} w={float(sample_weight):.3f} replay={int(is_replay_weighted)} "
                 f"recall@{eval_k}={last_metrics['edge_recall']:.4f} "
                 f"precision@{eval_k}={last_metrics['edge_precision']:.4f} "
                 f"self={last_metrics['self_loop_rate']:.4f}"
@@ -700,13 +897,19 @@ def train_topology_scorer(
                     examples_path=examples_path, best_metric=best_metric,
                     teacher_signal=teacher_signal, dense_checkpoint=dense_checkpoint, dense_mix=dense_mix,
                     resume_scorer_checkpoint=resume_scorer_checkpoint,
+                    replay_candidates_path=replay_candidates_path,
+                    replay_weight_scale=replay_weight_scale,
+                    replay_max_weight=replay_max_weight,
+                    replay_weighted_examples=replay_weighted_examples,
+                    replay_appended_examples=replay_appended_examples,
+                    replay_sample_ratio=replay_sample_ratio,
+                    replay_sampled_steps=replay_sampled_steps,
+                    best_selection=best_selection,
                 )
                 print(f"         saved best scorer to {best_path}")
 
         if (
-            runtime_quality_examples_path
-            and runtime_quality_checkpoint
-            and runtime_quality_interval > 0
+            runtime_quality_enabled
             and (step % runtime_quality_interval == 0 or step == max_steps - 1)
         ):
             _maybe_update_runtime_best(str(step))
@@ -719,19 +922,41 @@ def train_topology_scorer(
         middle_bridge_width=middle_bridge_width, topology_mode=topology_mode,
         examples_path=examples_path, best_metric=(best_metric if best_metric >= 0 else None),
         teacher_signal=teacher_signal, dense_checkpoint=dense_checkpoint, dense_mix=dense_mix,
-                    resume_scorer_checkpoint=resume_scorer_checkpoint,
+        resume_scorer_checkpoint=resume_scorer_checkpoint,
+        replay_candidates_path=replay_candidates_path,
+        replay_weight_scale=replay_weight_scale,
+        replay_max_weight=replay_max_weight,
+        replay_weighted_examples=replay_weighted_examples,
+        replay_appended_examples=replay_appended_examples,
+        replay_sample_ratio=replay_sample_ratio,
+        replay_sampled_steps=replay_sampled_steps,
     )
     print(f"Saved learned topology scorer to {save_checkpoint}")
+    edge_best_checkpoint = best_path if val_cached and best_metric >= 0 else ""
+    runtime_selected_checkpoint = runtime_best_path if runtime_best_score >= 0 else ""
+    selected_checkpoint = runtime_selected_checkpoint if best_selection == "runtime_quality" else edge_best_checkpoint
+    selected_score = runtime_best_score if best_selection == "runtime_quality" else (best_metric if best_metric >= 0 else 0.0)
     return {
         "examples": len(cached),
         "steps": stop_step + 1 if stopped_early else max_steps,
         "stopped_early": int(stopped_early),
         "loss": last_loss,
         "checkpoint": str(save_checkpoint),
-        "best_checkpoint": best_path if val_cached else "",
+        "best_selection": best_selection,
+        "selected_checkpoint": selected_checkpoint,
+        "selected_score": selected_score if selected_score >= 0 else 0.0,
+        "best_checkpoint": selected_checkpoint,
+        "edge_best_checkpoint": edge_best_checkpoint,
         "best_mean_row_recall": best_metric if best_metric >= 0 else 0.0,
-        "runtime_best_checkpoint": runtime_best_path if runtime_best_score >= 0 else "",
+        "runtime_best_checkpoint": runtime_selected_checkpoint,
         "runtime_best_score": runtime_best_score if runtime_best_score >= 0 else 0.0,
+        "replay_candidates_path": replay_candidates_path or "",
+        "replay_weighted_examples": replay_weighted_examples,
+        "replay_appended_examples": replay_appended_examples,
+        "replay_sample_ratio": float(replay_sample_ratio),
+        "replay_sampled_steps": replay_sampled_steps,
+        "replay_weight_scale": float(replay_weight_scale),
+        "replay_max_weight": float(replay_max_weight),
         **{f"runtime_{k}": v for k, v in last_runtime_quality.items()},
         **{f"runtime_best_{k}": v for k, v in best_runtime_quality.items()},
         **last_metrics,
@@ -766,6 +991,7 @@ def main() -> None:
     parser.add_argument("--eval-interval", type=int, default=250, dest="eval_interval")
     parser.add_argument("--eval-max-examples", type=int, default=512, dest="eval_max_examples")
     parser.add_argument("--best-checkpoint", default=None, dest="best_checkpoint")
+    parser.add_argument("--best-selection", default="edge_recall", choices=["edge_recall", "runtime_quality"], dest="best_selection")
     parser.add_argument("--runtime-quality-examples", default=None, dest="runtime_quality_examples_path")
     parser.add_argument("--runtime-quality-checkpoint", default=None, dest="runtime_quality_checkpoint")
     parser.add_argument("--runtime-quality-interval", type=int, default=0, dest="runtime_quality_interval")
@@ -777,6 +1003,10 @@ def main() -> None:
     parser.add_argument("--runtime-kl-loss", type=float, default=0.0, dest="runtime_kl_loss")
     parser.add_argument("--runtime-cos-loss", type=float, default=0.0, dest="runtime_cos_loss")
     parser.add_argument("--runtime-hidden-l1-loss", type=float, default=0.0, dest="runtime_hidden_l1_loss")
+    parser.add_argument("--replay-candidates", default=None, dest="replay_candidates_path")
+    parser.add_argument("--replay-weight-scale", type=float, default=0.1, dest="replay_weight_scale")
+    parser.add_argument("--replay-max-weight", type=float, default=8.0, dest="replay_max_weight")
+    parser.add_argument("--replay-sample-ratio", type=float, default=0.0, dest="replay_sample_ratio")
     args = parser.parse_args()
     summary = train_topology_scorer(
         examples_path=args.examples,
@@ -804,6 +1034,7 @@ def main() -> None:
         eval_interval=args.eval_interval,
         eval_max_examples=args.eval_max_examples,
         best_checkpoint=args.best_checkpoint,
+        best_selection=args.best_selection,
         runtime_quality_examples_path=args.runtime_quality_examples_path,
         runtime_quality_checkpoint=args.runtime_quality_checkpoint,
         runtime_quality_interval=args.runtime_quality_interval,
@@ -815,6 +1046,10 @@ def main() -> None:
         runtime_kl_loss=args.runtime_kl_loss,
         runtime_cos_loss=args.runtime_cos_loss,
         runtime_hidden_l1_loss=args.runtime_hidden_l1_loss,
+        replay_candidates_path=args.replay_candidates_path,
+        replay_weight_scale=args.replay_weight_scale,
+        replay_max_weight=args.replay_max_weight,
+        replay_sample_ratio=args.replay_sample_ratio,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

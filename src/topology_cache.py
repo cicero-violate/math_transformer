@@ -83,8 +83,8 @@ class PreparedTopology:
     objects to the model block once topology has been compiled.
     """
 
-    neighbors: torch.Tensor                 # (T, K) long, target device
-    valid_i8: torch.Tensor                  # (T, K) int8, target device
+    neighbors: torch.Tensor | None          # (T, K) long, target device; optional for native block-only
+    valid_i8: torch.Tensor | None           # (T, K) int8, target device; optional for native block-only
     diagnostics: MaskDiagnostics
     cache_key: str
     block_neighbors: torch.Tensor | None = None       # (B, K_B) long, target device
@@ -96,22 +96,31 @@ class PreparedTopology:
 
     @property
     def length(self) -> int:
-        return int(self.neighbors.shape[0])
+        if self.neighbors is not None:
+            return int(self.neighbors.shape[0])
+        return int(self.diagnostics.n)
 
     @property
     def k(self) -> int:
-        return int(self.neighbors.shape[1])
+        if self.neighbors is not None:
+            return int(self.neighbors.shape[1])
+        return 0
 
     @property
     def device(self) -> torch.device:
-        return self.neighbors.device
+        if self.neighbors is not None:
+            return self.neighbors.device
+        if self.block_neighbors is not None:
+            return self.block_neighbors.device
+        return torch.device("cpu")
 
     @property
     def memory_bytes(self) -> int:
-        total = int(
-            self.neighbors.numel() * self.neighbors.element_size()
-            + self.valid_i8.numel() * self.valid_i8.element_size()
-        )
+        total = 0
+        if self.neighbors is not None:
+            total += int(self.neighbors.numel() * self.neighbors.element_size())
+        if self.valid_i8 is not None:
+            total += int(self.valid_i8.numel() * self.valid_i8.element_size())
         if self.block_neighbors is not None:
             total += int(self.block_neighbors.numel() * self.block_neighbors.element_size())
         if self.block_valid_i8 is not None:
@@ -343,13 +352,14 @@ class TopologyCache:
         """Return an O(T*K) prepared topology for the fast path."""
         dev = device if device is not None else torch.device("cpu")
         mode = getattr(builder, "topology_mode", "union")
+        prepare_mode = getattr(builder, "prepare_mode", "full")
         middle_bridge_width = int(getattr(builder, "middle_bridge_width", 0))
         key = _cache_key(
             nodes, env, builder.topk, builder.local_window, max_neighbors, str(dev),
             topology_mode=mode,
             fixed_k=getattr(builder, "fixed_k", None),
             middle_bridge_width=middle_bridge_width,
-        ) + "|" + str(getattr(builder, "cache_config_key", "")) + "|prepared"
+        ) + "|" + str(getattr(builder, "cache_config_key", "")) + f"|prepare_mode={prepare_mode}|prepared"
 
         if key in self._prepared_store:
             self.cache_hits += 1
@@ -364,8 +374,8 @@ class TopologyCache:
             block_token_indices = getattr(prepared, "block_token_indices", None)
             block_token_valid_i8 = getattr(prepared, "block_token_valid_i8", None)
             out = PreparedTopology(
-                neighbors=prepared.token_neighbors.to(dev).contiguous(),
-                valid_i8=prepared.token_valid_i8.to(dev).contiguous(),
+                neighbors=None if prepared.token_neighbors is None else prepared.token_neighbors.to(dev).contiguous(),
+                valid_i8=None if prepared.token_valid_i8 is None else prepared.token_valid_i8.to(dev).contiguous(),
                 diagnostics=prepared.diagnostics,
                 cache_key=key,
                 block_neighbors=None if block_neighbors is None else block_neighbors.to(dev).contiguous(),

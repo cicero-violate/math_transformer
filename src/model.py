@@ -111,8 +111,14 @@ class MathRoutedTransformerBlock(nn.Module):
             nodes, z, env, self.topology, self.max_neighbors, device=dev
         )
         self._prepared_topology = prepared
-        self.static_neighbors = prepared.neighbors.to(dev).contiguous()
-        self.static_valid_i8 = prepared.valid_i8.to(dev).contiguous()
+        self.static_neighbors = (
+            torch.empty(0, 0, dtype=torch.long, device=dev)
+            if prepared.neighbors is None else prepared.neighbors.to(dev).contiguous()
+        )
+        self.static_valid_i8 = (
+            torch.empty(0, 0, dtype=torch.int8, device=dev)
+            if prepared.valid_i8 is None else prepared.valid_i8.to(dev).contiguous()
+        )
         if prepared.block_neighbors is not None:
             self.static_block_neighbors = prepared.block_neighbors.to(dev).contiguous()
         else:
@@ -139,6 +145,18 @@ class MathRoutedTransformerBlock(nn.Module):
         env: dict[str, tuple[int, ...]] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, PreparedTopology | None]:
         if (
+            self.attention_mode == "block_sparse"
+            and self._prepared_topology is not None
+            and self._prepared_topology.is_block_topology
+            and self.static_block_neighbors.numel() > 0
+            and self.static_block_valid_i8.numel() > 0
+            and self.static_block_size is not None
+            and self.static_block_size * self.static_block_neighbors.shape[0] >= len(nodes)
+            and self.static_block_neighbors.device == x.device
+        ):
+            return self.static_neighbors, self.static_valid_i8, self._prepared_topology
+
+        if (
             self.static_neighbors.numel() > 0
             and self.static_valid_i8.numel() > 0
             and self.static_neighbors.shape[0] == len(nodes)
@@ -151,6 +169,8 @@ class MathRoutedTransformerBlock(nn.Module):
         prepared = cache.get_or_prepare(
             nodes, z, env, self.topology, self.max_neighbors, device=x.device
         )
+        if prepared.neighbors is None or prepared.valid_i8 is None:
+            return torch.empty(0, 0, dtype=torch.long, device=x.device), torch.empty(0, 0, dtype=torch.int8, device=x.device), prepared
         return prepared.neighbors, prepared.valid_i8, prepared
 
     def _ff_inference(self, x: torch.Tensor) -> torch.Tensor:
@@ -203,15 +223,13 @@ class MathRoutedTransformerBlock(nn.Module):
         """Run inference using already-prepared static topology buffers."""
         if self.attention_mode not in ("neighbor_sparse", "block_sparse"):
             raise RuntimeError("forward_static_fast_path requires sparse attention")
-        if self.static_neighbors.numel() == 0 or self.static_valid_i8.numel() == 0:
-            raise RuntimeError("forward_static_fast_path requires prepare_static_topology first")
-        if self.static_neighbors.shape[0] != x.shape[1]:
-            raise RuntimeError("static topology length does not match input sequence length")
-        if self.static_neighbors.device != x.device:
-            raise RuntimeError("static topology device does not match input device")
         if self.attention_mode == "block_sparse":
             if self.static_block_neighbors.numel() == 0 or self.static_block_valid_i8.numel() == 0 or self.static_block_size is None:
                 raise RuntimeError("block_sparse static path requires block topology fields")
+            if self.static_block_size * self.static_block_neighbors.shape[0] < x.shape[1]:
+                raise RuntimeError("static block topology length does not cover input sequence length")
+            if self.static_block_neighbors.device != x.device:
+                raise RuntimeError("static block topology device does not match input device")
             attn_out = self.attn(
                 self.norm1(x),
                 self.static_block_neighbors,
@@ -221,6 +239,12 @@ class MathRoutedTransformerBlock(nn.Module):
                 block_token_valid_i8=self.static_block_token_valid_i8 if self.static_block_token_valid_i8.numel() else None,
             )
         else:
+            if self.static_neighbors.numel() == 0 or self.static_valid_i8.numel() == 0:
+                raise RuntimeError("forward_static_fast_path requires prepare_static_topology first")
+            if self.static_neighbors.shape[0] != x.shape[1]:
+                raise RuntimeError("static topology length does not match input sequence length")
+            if self.static_neighbors.device != x.device:
+                raise RuntimeError("static topology device does not match input device")
             attn_out = self.attn.forward_fused_norm_qkv(
                 x, self.norm1, self.static_neighbors, self.static_valid_i8,
                 selector_mode=self.sparse_selector,
