@@ -39,6 +39,8 @@ BLOCK_TOKEN_CAP_SWEEP="${BLOCK_TOKEN_CAP_SWEEP:-}"
 NATIVE_BLOCK_SPARSE="${NATIVE_BLOCK_SPARSE:-0}"
 TMP_DIR="${TMP_DIR:-runs/benchmarks/learned_topology_tmp}"
 TRACE_OUTPUT="${TRACE_OUTPUT:-}"
+ARTIFACT_JSON="${ARTIFACT_JSON:-$TMP_DIR/benchmark_artifact.json}"
+ARTIFACT_JSONL="${ARTIFACT_JSONL:-runs/benchmarks/learned_topology_benchmark_artifacts.jsonl}"
 mkdir -p "$TMP_DIR"
 
 if [[ -n "$BLOCK_TOKEN_CAP_SWEEP" ]]; then
@@ -188,11 +190,32 @@ fi
   "${HAND_PAIRED_TRITON_ARGS[@]}" "${LEARNED_PAIRED_TRITON_ARGS[@]}" "${FUSION_ARGS[@]}" "${TOPOLOGY_ARGS[@]}" \
   --hand-save-dir "$hand_dir" --learned-save-dir "$learned_dir" >/dev/null
 
-"$PYTHON" - "$quality_log" "$hand_dir" "$learned_dir" "$HAND_K" "$LEARNED_K" "$ALLOW_FAIL" "$ACCEPTANCE_TOL_MS" <<'PY2'
+"$PYTHON" - "$quality_log" "$hand_dir" "$learned_dir" "$HAND_K" "$LEARNED_K" "$ALLOW_FAIL" "$ACCEPTANCE_TOL_MS" "$SCORER" "$CHECKPOINT" "$EXAMPLES" "$DEVICE" "$BENCH_N" "$BENCH_NODE_MODE" "$BENCH_STEPS" "$BENCH_SEED" "$ARTIFACT_JSON" "$ARTIFACT_JSONL" "$TMP_DIR" <<'PY2'
 from __future__ import annotations
 import json, re, sys
 from pathlib import Path
-quality_log, hand_dir, learned_dir, hand_k, learned_k, allow_fail, acceptance_tol_ms = sys.argv[1:]
+from src.topology_benchmark_artifact import build_benchmark_artifact, write_artifacts
+
+(
+    quality_log,
+    hand_dir,
+    learned_dir,
+    hand_k,
+    learned_k,
+    allow_fail,
+    acceptance_tol_ms,
+    scorer,
+    checkpoint,
+    examples,
+    device,
+    bench_n,
+    bench_node_mode,
+    bench_steps,
+    bench_seed,
+    artifact_json,
+    artifact_jsonl,
+    tmp_dir,
+) = sys.argv[1:]
 hand_k_i = int(hand_k); learned_k_i = int(learned_k); allow = allow_fail == "1"
 tol_ms = float(acceptance_tol_ms)
 text = Path(quality_log).read_text()
@@ -254,6 +277,39 @@ print(f"learned_token_scaling_ok={learned_b.get('by_relation', {}).get('block_sc
 
 hand_p = paired_buckets(hand_b)
 learned_p = paired_buckets(learned_b)
+artifact = build_benchmark_artifact(
+    quality_log_text=text,
+    hand_report=hand_b,
+    learned_report=learned_b,
+    hand_k=hand_k_i,
+    learned_k=learned_k_i,
+    acceptance_tolerance_ms=tol_ms,
+    config={
+        "hand_k": hand_k_i,
+        "learned_k": learned_k_i,
+        "bench_n": int(bench_n),
+        "bench_node_mode": bench_node_mode,
+        "bench_steps": int(bench_steps),
+        "bench_seed": None if bench_seed in {"", "None"} else int(bench_seed),
+        "device": device,
+        "topology_mode": learned_mode,
+        "acceptance_tolerance_ms": tol_ms,
+    },
+    paths={
+        "scorer": scorer,
+        "checkpoint": checkpoint,
+        "examples": examples,
+        "quality_log": quality_log,
+        "hand_report_dir": hand_dir,
+        "learned_report_dir": learned_dir,
+        "tmp_dir": tmp_dir,
+    },
+)
+write_artifacts(artifact, json_path=artifact_json or None, jsonl_path=artifact_jsonl or None)
+if artifact_json:
+    print(f"benchmark_artifact_json={artifact_json}")
+if artifact_jsonl:
+    print(f"benchmark_artifact_jsonl={artifact_jsonl}")
 bucket_keys = [
     "topology_prepare_ms",
     "norm1_ms",

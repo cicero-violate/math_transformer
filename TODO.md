@@ -57,8 +57,8 @@ strict_speed_ok=True
 |    3 | Preserve K=8 learned-topology baseline      | Done    | Champion K=8 learned topology passes current quality/speed proof vs hand K=16.                                                        | Use champion as default runtime scorer and historical baselines only for comparison.                                  |
 |    4 | Route-first/generic-aware runtime selection | Done    | Runtime checkpoint selection now prioritizes route accuracy, then generic expert accuracy, before dense/hidden/logit proxy metrics.   | Keep proxy metrics as tie-breakers only.                                                                              |
 |    5 | Replay/failure learning loop                | Partial | Trace replay, appended replay records, replay weighting, replay oversampling, and route-first runtime selection exist.                | Run replay loops only through promotion gate; tune replay ratios only if they beat champion.                          |
-|    6 | Lock evaluator and benchmark protocol       | Partial | Quality/benchmark scripts exist; timing noise and hardware variance still affect speed conclusions.                                   | Freeze command configs, seeds, hardware notes, metrics, tolerances, and pass/fail gates.                              |
-|    7 | Topology trace logging                      | Partial | `src/topology_trace.py`, scorer eval traces, quality traces, and standardized failure traces exist.                                   | Add full benchmark artifact traces and richer per-run metadata.                                                       |
+|    6 | Lock evaluator and benchmark protocol       | Partial | Quality/benchmark scripts exist; benchmark artifacts now record config, seeds, hardware, hashes, quality, speed, and gates.            | Run repeated locked benchmark artifacts on target hardware to quantify timing variance.                                |
+|    7 | Topology trace logging                      | Done    | `src/topology_trace.py`, scorer eval traces, quality traces, standardized failure traces, and benchmark JSON/JSONL artifacts exist.    | Keep artifacts as promotion/regression audit evidence.                                                                |
 |    8 | Learned-topology failure diagnostics        | Done    | `src/export_learned_topology_failures.py` emits standard trace schema with route misses, missing/extra edges, and hidden/logit drift. | Keep diagnostics as replay/training input and promotion audit evidence.                                               |
 |    9 | Hard validation expansion                   | Partial | Synthetic hard validation exists; generic expert remains the main failure mode.                                                       | Add deeper trees, longer dependencies, ambiguous operators, held-out templates, larger `T`, and generic-stress cases. |
 |   10 | Prepared topology cache / baked sparse IR   | Partial | `src/topology_cache.py` has prepared topology and neighbor-table caching; baked artifact workflow is not canonical.                   | Cache compiled neighbor tables keyed by nodes, feature schema, scorer checkpoint, topology config, and window.        |
@@ -84,8 +84,8 @@ strict_speed_ok=True
 | ---:     | ---                                    | ---     | ---                                                                                                           |
 | P0       | Keep champion default wired            | Done    | Inference/eval scripts default to `runs/checkpoints/topology_scorer.champion.pt`.                             |
 | P0       | Lock evaluator command suite           | Partial | One command set produces stable quality/speed reports with committed settings and seeds.                      |
-| P0       | Full benchmark artifact trace          | Pending | Benchmark runs emit a JSON/JSONL artifact with quality, speed buckets, checkpoint hash, hardware, and config. |
-| P0       | Champion regression check script       | Pending | One command verifies champion quality/speed has not regressed after code changes.                             |
+| P0       | Full benchmark artifact trace          | Done    | `scripts/benchmark_learned_topology.sh` emits JSON/JSONL artifacts with quality, speed buckets, hashes, hardware, config, and gates. |
+| P0       | Champion regression check script       | Done    | `scripts/check_topology_champion_regression.sh` benchmarks the champion and verifies artifact gates against champion metadata.        |
 | P1       | Expand hard validation set             | Partial | Add deeper/longer/held-out/generic-stress examples and report route/expert breakdown.                         |
 | P1       | Profile execution buckets              | Partial | Produce stable timing table for topology prepare, QKV, attention, outproj, FFN, router, total.                |
 | P1       | Bake prepared topology cache           | Partial | Reused graphs/snapshots bypass scorer/topology rebuild and load neighbor tables directly.                     |
@@ -105,6 +105,9 @@ strict_speed_ok=True
 LEARNED_K=8 \
 HAND_K=16 \
 scripts/benchmark_learned_topology.sh
+
+# Champion regression proof with structured artifact audit
+scripts/check_topology_champion_regression.sh
 
 # Learned topology quality evaluation, champion default
 scripts/run_learned_topology_quality.sh

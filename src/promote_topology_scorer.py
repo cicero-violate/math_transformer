@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .eval import QualityReport, run_quality_eval
+from .topology_benchmark_artifact import load_artifact
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,10 @@ def evaluate_scorer_metrics(
 
 
 def parse_benchmark_gate(text: str) -> BenchmarkGate:
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        data = json.loads(stripped)
+        return benchmark_gate_from_artifact(data)
     accept = re.search(
         r"acceptance_passed\s+quality_ok=(True|False)\s+speed_ok=(True|False)\s+strict_speed_ok=(True|False)",
         text,
@@ -116,8 +121,79 @@ def parse_benchmark_gate(text: str) -> BenchmarkGate:
     )
 
 
+def benchmark_gate_from_artifact(data: dict[str, Any]) -> BenchmarkGate:
+    acceptance = data.get("acceptance", {}) or {}
+    speed = data.get("speed", {}) or {}
+    quality = data.get("quality", {}) or {}
+    learned = quality.get("learned", {}) or {}
+    hand = quality.get("hand", {}) or {}
+    return BenchmarkGate(
+        quality_ok=bool(acceptance.get("quality_ok", quality.get("quality_ok", False))),
+        speed_ok=bool(acceptance.get("speed_ok", speed.get("speed_ok", False))),
+        strict_speed_ok=bool(acceptance.get("strict_speed_ok", speed.get("strict_speed_ok", False))),
+        speedup=float(speed.get("speedup", 0.0) or 0.0),
+        learned_route_acc=None if learned.get("route_acc") is None else float(learned.get("route_acc")),
+        hand_route_acc=None if hand.get("route_acc") is None else float(hand.get("route_acc")),
+    )
+
+
 def parse_benchmark_gate_file(path: str | Path) -> BenchmarkGate:
-    return parse_benchmark_gate(Path(path).read_text(encoding="utf-8", errors="replace"))
+    p = Path(path)
+    if p.suffix in {".json", ".jsonl"}:
+        return benchmark_gate_from_artifact(load_artifact(p))
+    return parse_benchmark_gate(p.read_text(encoding="utf-8", errors="replace"))
+
+
+def champion_regression_from_artifact(
+    *,
+    artifact: dict[str, Any],
+    champion: PromotionMetrics,
+    route_min_delta: float = 0.0,
+    generic_min_delta: float = 0.0,
+) -> PromotionDecision:
+    quality = artifact.get("quality", {}) or {}
+    learned = quality.get("learned", {}) or {}
+    by_expert = learned.get("by_expert", {}) or {}
+    generic = by_expert.get("generic_expert", {}) or {}
+    total = int(generic.get("total", 0) or 0)
+    correct = int(generic.get("correct", 0) or 0)
+    generic_acc = float(generic.get("accuracy", 0.0) or 0.0)
+    if total == 0 and champion.generic_total > 0:
+        return PromotionDecision(
+            False,
+            "missing_generic_expert_metrics",
+            PromotionMetrics(
+                checkpoint=str((artifact.get("paths", {}) or {}).get("scorer", "")),
+                route_acc=float(learned.get("route_acc", 0.0) or 0.0),
+                generic_acc=0.0,
+                generic_correct=0,
+                generic_total=0,
+                examples=int(learned.get("examples", 0) or 0),
+            ),
+            champion,
+            benchmark_gate_from_artifact(artifact),
+        )
+    candidate = PromotionMetrics(
+        checkpoint=str((artifact.get("paths", {}) or {}).get("scorer", "")),
+        route_acc=float(learned.get("route_acc", 0.0) or 0.0),
+        generic_acc=generic_acc,
+        generic_correct=correct,
+        generic_total=total,
+        examples=int(learned.get("examples", 0) or 0),
+        dense_agree=learned.get("dense_agree"),
+        hidden_cos=learned.get("hidden_cos"),
+        logit_kl=learned.get("logit_kl"),
+    )
+    return decide_promotion(
+        candidate=candidate,
+        champion=champion,
+        benchmark=benchmark_gate_from_artifact(artifact),
+        require_benchmark=True,
+        route_min_delta=route_min_delta,
+        generic_min_delta=generic_min_delta,
+    )
+
+
 
 
 def decide_promotion(
