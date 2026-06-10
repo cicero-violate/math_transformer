@@ -4,7 +4,7 @@
 
 Build a math-routed transformer block that preserves dense-model quality while reducing full block latency through symbolic top-K sparse attention.
 
-The target is not to process every symbolic edge faster. The target is to compile a large symbolic topology into a bounded neighbor table, run attention over that selected subset, and beat the dense transformer block at useful quality.
+The target is not to process every symbolic edge faster. The target is to compile a large symbolic topology into a bounded neighbor table, run atteention over that selected subset, and beat the dense transformer block at useful quality.
 
 ---
 
