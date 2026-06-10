@@ -87,6 +87,12 @@ class PreparedTopology:
     valid_i8: torch.Tensor                  # (T, K) int8, target device
     diagnostics: MaskDiagnostics
     cache_key: str
+    block_neighbors: torch.Tensor | None = None       # (B, K_B) long, target device
+    block_valid_i8: torch.Tensor | None = None        # (B, K_B) int8, target device
+    block_token_indices: torch.Tensor | None = None   # (B, K_B, C) long, target device
+    block_token_valid_i8: torch.Tensor | None = None  # (B, K_B, C) int8, target device
+    block_size: int | None = None
+    is_block_topology: bool = False
 
     @property
     def length(self) -> int:
@@ -102,10 +108,19 @@ class PreparedTopology:
 
     @property
     def memory_bytes(self) -> int:
-        return int(
+        total = int(
             self.neighbors.numel() * self.neighbors.element_size()
             + self.valid_i8.numel() * self.valid_i8.element_size()
         )
+        if self.block_neighbors is not None:
+            total += int(self.block_neighbors.numel() * self.block_neighbors.element_size())
+        if self.block_valid_i8 is not None:
+            total += int(self.block_valid_i8.numel() * self.block_valid_i8.element_size())
+        if self.block_token_indices is not None:
+            total += int(self.block_token_indices.numel() * self.block_token_indices.element_size())
+        if self.block_token_valid_i8 is not None:
+            total += int(self.block_token_valid_i8.numel() * self.block_token_valid_i8.element_size())
+        return total
 
 
 def page_neighbor_table(
@@ -334,11 +349,34 @@ class TopologyCache:
             topology_mode=mode,
             fixed_k=getattr(builder, "fixed_k", None),
             middle_bridge_width=middle_bridge_width,
-        ) + "|prepared"
+        ) + "|" + str(getattr(builder, "cache_config_key", "")) + "|prepared"
 
         if key in self._prepared_store:
             self.cache_hits += 1
             return self._prepared_store[key]
+
+        if hasattr(builder, "prepare_topology"):
+            prepared = builder.prepare_topology(
+                nodes, z, env, max_neighbors=max_neighbors, device=dev
+            )
+            block_neighbors = getattr(prepared, "block_neighbors", None)
+            block_valid_i8 = getattr(prepared, "block_valid_i8", None)
+            block_token_indices = getattr(prepared, "block_token_indices", None)
+            block_token_valid_i8 = getattr(prepared, "block_token_valid_i8", None)
+            out = PreparedTopology(
+                neighbors=prepared.token_neighbors.to(dev).contiguous(),
+                valid_i8=prepared.token_valid_i8.to(dev).contiguous(),
+                diagnostics=prepared.diagnostics,
+                cache_key=key,
+                block_neighbors=None if block_neighbors is None else block_neighbors.to(dev).contiguous(),
+                block_valid_i8=None if block_valid_i8 is None else block_valid_i8.to(dev).contiguous(),
+                block_token_indices=None if block_token_indices is None else block_token_indices.to(dev).contiguous(),
+                block_token_valid_i8=None if block_token_valid_i8 is None else block_token_valid_i8.to(dev).contiguous(),
+                block_size=getattr(prepared, "block_size", None),
+                is_block_topology=bool(getattr(prepared, "is_block_topology", False)),
+            )
+            self._prepared_store[key] = out
+            return out
 
         cached = self.get_or_build(
             nodes, z, env, builder,

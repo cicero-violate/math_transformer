@@ -331,6 +331,138 @@ class NeighborSparseMathAttention(_AttentionBase):
         )
 
 
+class BlockSparseMathAttention(_AttentionBase):
+    """Multi-head attention that consumes block-neighbor topology directly."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        use_fast: bool = True,
+    ) -> None:
+        super().__init__(d_model, n_heads, dropout)
+        self.use_fast = bool(use_fast)
+        self._qkv_weight_cache: torch.Tensor | None = None
+        self._qkv_weight_versions: tuple[int, int, int] | None = None
+
+    def _fused_qkv_weight(self) -> torch.Tensor:
+        if torch.is_grad_enabled() and self.training:
+            return torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            )
+        versions = (
+            self.q_proj.weight._version,
+            self.k_proj.weight._version,
+            self.v_proj.weight._version,
+        )
+        cache = self._qkv_weight_cache
+        if (
+            cache is None
+            or self._qkv_weight_versions != versions
+            or cache.device != self.q_proj.weight.device
+            or cache.dtype != self.q_proj.weight.dtype
+        ):
+            self._qkv_weight_cache = torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            ).detach()
+            self._qkv_weight_versions = versions
+        return self._qkv_weight_cache
+
+    def project_norm_qkv_for_profile(
+        self, x: torch.Tensor, norm: nn.LayerNorm
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x.is_cuda:
+            from .triton_attention import TRITON_AVAILABLE, triton_layernorm_qkv
+            if TRITON_AVAILABLE:
+                return triton_layernorm_qkv(
+                    x, self._fused_qkv_weight(), norm.weight, norm.bias, norm.eps, self.n_heads
+                )
+        return self._project(norm(x))
+
+    def _block_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_neighbors: torch.Tensor,
+        block_valid_i8: torch.Tensor | None,
+        block_size: int,
+        block_token_indices: torch.Tensor | None = None,
+        block_token_valid_i8: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.use_fast:
+            from .block_sparse_attention import block_sparse_attention_fast
+            return block_sparse_attention_fast(
+                q, k, v, block_neighbors, block_valid_i8, block_size,
+                block_token_indices=block_token_indices,
+                block_token_valid_i8=block_token_valid_i8,
+            )
+        from .block_sparse_attention import block_sparse_attention_reference
+        return block_sparse_attention_reference(q, k, v, block_neighbors, block_valid_i8, block_size)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        block_neighbors: torch.Tensor,
+        block_valid_i8: torch.Tensor | None,
+        block_size: int,
+        block_token_indices: torch.Tensor | None = None,
+        block_token_valid_i8: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        q, k, v = self._project(x)
+        out = self._block_attention(
+            q, k, v, block_neighbors, block_valid_i8, block_size,
+            block_token_indices=block_token_indices,
+            block_token_valid_i8=block_token_valid_i8,
+        )
+        return self._collect(out, B, T)
+
+    def project_qkv_for_profile(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._project(x)
+
+    def block_attention_for_profile(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_neighbors: torch.Tensor,
+        block_valid_i8: torch.Tensor | None,
+        block_size: int,
+        block_token_indices: torch.Tensor | None = None,
+        block_token_valid_i8: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._block_attention(
+            q, k, v, block_neighbors, block_valid_i8, block_size,
+            block_token_indices=block_token_indices,
+            block_token_valid_i8=block_token_valid_i8,
+        )
+
+    def attention_out_project_for_profile(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_neighbors: torch.Tensor,
+        block_valid_i8: torch.Tensor | None,
+        block_size: int,
+        block_token_indices: torch.Tensor | None = None,
+        block_token_valid_i8: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out_bhtd = self._block_attention(
+            q, k, v, block_neighbors, block_valid_i8, block_size,
+            block_token_indices=block_token_indices,
+            block_token_valid_i8=block_token_valid_i8,
+        )
+        return self._collect_bhtd(out_bhtd)
+
+    def out_project_for_profile(self, out: torch.Tensor) -> torch.Tensor:
+        return self.out_proj(self._maybe_dropout(out))
+
+
 # ── Aliases / backwards compat ────────────────────────────────────────────────
 
 MathRoutedAttention = DenseMaskedMathAttention

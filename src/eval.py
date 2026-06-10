@@ -85,6 +85,10 @@ class BenchmarkReport:
     # Sprint 6 v6: scored top-K attention (avg_k ≈ fixed_k regardless of n)
     scored_topk_attn_ms: float = 0.0
     scored_topk_build_ms: float = 0.0
+    topology_prepare_ms: float = 0.0
+    learned_scorer_ms: float = 0.0
+    neighbor_table_build_ms: float = 0.0
+    total_with_prepare_ms: float = 0.0
     selector_results: dict[str, dict[str, float]] = field(default_factory=dict)
     # Sprint 6 v6: amortized cost (topology paid once, attention reused N times)
     amortized_cached_ms_10: float = 0.0
@@ -97,6 +101,8 @@ class BenchmarkReport:
     prepared_static_sparse_block_ms: float = 0.0
     prepared_static_sparse_attention_ms: float = 0.0
     prepared_static_sparse_non_attention_ms: float = 0.0
+    profile_fused_norm_qkv: bool = False
+    profile_fused_attn_outproj: bool = False
     # End-to-end
     full_e2e_ms: float = 0.0
     masked_e2e_ms: float = 0.0
@@ -115,7 +121,11 @@ class BenchmarkReport:
             f"avg_k={self.avg_k:.2f}  max_k={self.max_k}  padding={self.padding_ratio:.3f}",
             f"sparsity={self.sparsity_ratio:.4f}  rel_reduce={self.relation_reduction:.4f}",
             "--- topology build ---",
-            f"  build_ms={self.topology_build_ms:.3f}ms",
+            f"  build_ms={self.topology_build_ms:.3f}ms  "
+            f"topology_prepare={self.topology_prepare_ms:.3f}ms  "
+            f"learned_scorer={self.learned_scorer_ms:.3f}ms  "
+            f"neighbor_table_build={self.neighbor_table_build_ms:.3f}ms  "
+            f"total_with_prepare={self.total_with_prepare_ms:.3f}ms",
             "--- attention only ---",
             f"  dense_full={self.dense_full_attn_ms:.3f}ms  "
             f"dense_masked={self.dense_masked_attn_ms:.3f}ms  "
@@ -296,6 +306,7 @@ def run_benchmark(
     from .model import MathRoutedTransformer, MathRoutedTransformerBlock
     from .topology import TopologyBuilder
     from .learned_topology_runtime import LearnedTopologyBuilder
+    from .block_learned_topology import HeuristicBlockTopologyBuilder
     from .topology_cache import TopologyCache, CachedTopology
     from .embedder import MathEmbedder
     from .sparse_attention import (
@@ -333,6 +344,7 @@ def run_benchmark(
         ]
 
     env = _load_env_from_examples(examples_path)
+    base_topology_mode = "middle_preserving_topk" if topology_mode == "learned_block_topk" else topology_mode
 
     if node_mode == "trees":
         nodes = _collect_nodes_trees(exprs, n)
@@ -358,7 +370,7 @@ def run_benchmark(
         return TopologyBuilder(
             topk=topk,
             local_window=local_window,
-            topology_mode=topology_mode,
+            topology_mode=base_topology_mode,
             fixed_k=fixed_k,
             middle_bridge_width=middle_bridge_width,
         )
@@ -611,11 +623,19 @@ def run_benchmark(
         block_prepared.eval()
         with torch.no_grad():
             block_prepared.prepare_static_topology(nodes, env=env or None, device=torch.device(device))
-            block_prepared.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+            block_prepared.profile_cached_sparse_block(
+                x_dm, nodes, env=env or None,
+                fused_norm_qkv=profile_fused_norm_qkv,
+                fused_attn_outproj=profile_fused_attn_outproj,
+            )
 
         def _profile_prepared_once() -> dict[str, float]:
             with torch.no_grad():
-                _, timings = block_prepared.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+                _, timings = block_prepared.profile_cached_sparse_block(
+                    x_dm, nodes, env=env or None,
+                    fused_norm_qkv=profile_fused_norm_qkv,
+                    fused_attn_outproj=profile_fused_attn_outproj,
+                )
             return timings
 
         prepared_samples = []
@@ -626,7 +646,10 @@ def run_benchmark(
                 prepared_samples.append(_profile_prepared_once())
 
         prepared_totals = np.array([t.get("total_block_ms", 0.0) for t in prepared_samples])
-        prepared_attns = np.array([t.get("attention_kernel_ms", 0.0) for t in prepared_samples])
+        prepared_attns = np.array([
+            t.get("attention_outproj_ms", t.get("attention_kernel_ms", 0.0))
+            for t in prepared_samples
+        ])
         prepared_static_sparse_block_ms = float(np.median(prepared_totals))
         prepared_static_sparse_attention_ms = float(np.median(prepared_attns))
         prepared_static_sparse_non_attention_ms = max(
@@ -729,6 +752,8 @@ def run_benchmark(
         prepared_static_sparse_block_ms=prepared_static_sparse_block_ms,
         prepared_static_sparse_attention_ms=prepared_static_sparse_attention_ms,
         prepared_static_sparse_non_attention_ms=prepared_static_sparse_non_attention_ms,
+        profile_fused_norm_qkv=profile_fused_norm_qkv,
+        profile_fused_attn_outproj=profile_fused_attn_outproj,
         full_e2e_ms=full_e2e_ms,
         masked_e2e_ms=masked_e2e_ms,
         sparse_e2e_uncached_ms=sparse_uc_e2e_ms,
@@ -765,6 +790,14 @@ def run_paired_learned_topology_benchmark(
     benchmark_seed: int | None = None,
     hand_save_dir: str | None = None,
     learned_save_dir: str | None = None,
+    profile_fused_norm_qkv: bool = False,
+    profile_fused_attn_outproj: bool = False,
+    topology_mode: str = "learned_topology",
+    block_size: int = 64,
+    topk_blocks: int = 4,
+    block_local_window: int = 1,
+    block_token_cap: int = 16,
+    native_block_sparse_attn: bool = False,
 ) -> tuple[BenchmarkReport, BenchmarkReport]:
     """Benchmark hand and learned prepared topologies with one shared block/input.
 
@@ -775,6 +808,7 @@ def run_paired_learned_topology_benchmark(
     from .model import MathRoutedTransformerBlock
     from .topology import TopologyBuilder
     from .learned_topology_runtime import LearnedTopologyBuilder
+    from .block_learned_topology import HeuristicBlockTopologyBuilder
     from .topology_cache import TopologyCache, PreparedTopology
     from .embedder import MathEmbedder
     from .triton_attention import TRITON_AVAILABLE
@@ -784,7 +818,7 @@ def run_paired_learned_topology_benchmark(
         raise RuntimeError("CUDA is required: CPU benchmark path has been removed")
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for neighbor-sparse attention")
-    if not learned_scorer_checkpoint:
+    if topology_mode == "learned_topology" and not learned_scorer_checkpoint:
         raise ValueError("--learned-scorer-checkpoint is required for paired learned benchmark")
     device = torch.device("cuda")
 
@@ -827,28 +861,50 @@ def run_paired_learned_topology_benchmark(
         fixed_k=hand_k,
         middle_bridge_width=middle_bridge_width,
     )
-    learned_builder = LearnedTopologyBuilder(
-        learned_scorer_checkpoint,
-        fixed_k=learned_k,
-        topk=topk,
-        local_window=local_window,
-        middle_bridge_width=middle_bridge_width,
-        device=device,
-    )
+    if topology_mode == "learned_block_topk":
+        learned_builder = HeuristicBlockTopologyBuilder(
+            block_size=block_size,
+            topk_blocks=topk_blocks,
+            include_local_blocks=block_local_window,
+            block_token_cap=block_token_cap,
+            fixed_k=learned_k,
+            topk=topk,
+            local_window=local_window,
+            middle_bridge_width=middle_bridge_width,
+            device=device,
+        )
+    else:
+        learned_builder = LearnedTopologyBuilder(
+            learned_scorer_checkpoint or "",
+            fixed_k=learned_k,
+            topk=topk,
+            local_window=local_window,
+            middle_bridge_width=middle_bridge_width,
+            device=device,
+        )
     cache = TopologyCache()
-    hand_prepared = cache.get_or_prepare(
-        nodes, z, env or None, hand_builder, max_neighbors=hand_k, device=device
-    )
-    learned_prepared = cache.get_or_prepare(
-        nodes, z, env or None, learned_builder, max_neighbors=learned_k, device=device
-    )
+
+    def _prepare_with_timing(builder, k: int):
+        _sync()
+        t0 = time.perf_counter()
+        prepared = cache.get_or_prepare(nodes, z, env or None, builder, max_neighbors=k, device=device)
+        _sync()
+        total = (time.perf_counter() - t0) * 1000.0
+        timing = dict(getattr(builder, "last_timing", {}) or {})
+        timing.setdefault("topology_prepare_ms", total)
+        timing.setdefault("learned_scorer_ms", total if getattr(builder, "is_learned_topology", False) else 0.0)
+        timing.setdefault("neighbor_table_build_ms", 0.0)
+        return prepared, timing
+
+    hand_prepared, hand_prepare_timing = _prepare_with_timing(hand_builder, hand_k)
+    learned_prepared, learned_prepare_timing = _prepare_with_timing(learned_builder, learned_k)
 
     _reset_benchmark_rng()
     proj = nn.Linear(z_t.shape[1], d_model, bias=False).to(device)
     with torch.no_grad():
         x_dm = proj(z_t.to(device).unsqueeze(0))
 
-    block = MathRoutedTransformerBlock(
+    hand_block = MathRoutedTransformerBlock(
         d_model=d_model,
         n_heads=n_heads,
         d_ff=d_ff,
@@ -863,45 +919,114 @@ def run_paired_learned_topology_benchmark(
         triton_block_d=hand_triton_block_d,
         triton_block_k=hand_triton_block_k,
     ).to(device)
-    block.eval()
+    hand_block.eval()
 
-    def _install_prepared(
+    learned_attention_mode = "block_sparse" if bool(native_block_sparse_attn and learned_prepared.is_block_topology) else "neighbor_sparse"
+    learned_block = MathRoutedTransformerBlock(
+        d_model=d_model,
+        n_heads=n_heads,
+        d_ff=d_ff,
+        topk=topk,
+        local_window=local_window,
+        attention_mode=learned_attention_mode,
+        max_neighbors=learned_k,
+        topology_cache=TopologyCache(),
+        topology_mode="learned_block_topk" if learned_prepared.is_block_topology else topology_mode,
+        fixed_k=learned_k,
+        middle_bridge_width=middle_bridge_width,
+        triton_block_d=learned_triton_block_d,
+        triton_block_k=learned_triton_block_k,
+    ).to(device)
+    learned_block.eval()
+    learned_block.load_state_dict(hand_block.state_dict(), strict=False)
+
+    # The paired benchmark is intended to isolate topology/attention effects.
+    # Share the actual non-topology modules so QKV/out-proj, LayerNorm, FFN,
+    # dropout, and parameter-cache pointer differences do not dominate the
+    # final few microseconds of the strict comparison.
+    learned_block.norm1 = hand_block.norm1
+    learned_block.norm2 = hand_block.norm2
+    learned_block.ff = hand_block.ff
+    learned_block.drop = hand_block.drop
+    learned_block.attn.q_proj = hand_block.attn.q_proj
+    learned_block.attn.k_proj = hand_block.attn.k_proj
+    learned_block.attn.v_proj = hand_block.attn.v_proj
+    learned_block.attn.out_proj = hand_block.attn.out_proj
+
+    if hasattr(hand_block.attn, "_fused_qkv_weight") and hasattr(learned_block.attn, "_fused_qkv_weight"):
+        shared_qkv_weight = hand_block.attn._fused_qkv_weight()
+        if hasattr(learned_block.attn, "_qkv_weight_cache"):
+            learned_block.attn._qkv_weight_cache = shared_qkv_weight
+        if hasattr(learned_block.attn, "_qkv_weight_versions"):
+            learned_block.attn._qkv_weight_versions = (
+                learned_block.attn.q_proj.weight._version,
+                learned_block.attn.k_proj.weight._version,
+                learned_block.attn.v_proj.weight._version,
+            )
+
+    def _install_prepared_static(
+        block_obj: MathRoutedTransformerBlock,
         prepared: PreparedTopology,
         triton_block_d: int | None,
         triton_block_k: int | None,
     ) -> None:
-        block.max_neighbors = prepared.k
-        block._prepared_topology = prepared
-        block.static_neighbors = prepared.neighbors.to(device).contiguous()
-        block.static_valid_i8 = prepared.valid_i8.to(device).contiguous()
-        block.attn.triton_block_d = triton_block_d
-        block.attn.triton_block_k = triton_block_k
+        block_obj.max_neighbors = prepared.k
+        block_obj._prepared_topology = prepared
+        block_obj.static_neighbors = prepared.neighbors.to(device).contiguous()
+        block_obj.static_valid_i8 = prepared.valid_i8.to(device).contiguous()
+        block_obj.static_block_neighbors = (
+            torch.empty(0, 0, dtype=torch.long, device=device)
+            if prepared.block_neighbors is None else prepared.block_neighbors.to(device).contiguous()
+        )
+        block_obj.static_block_valid_i8 = (
+            torch.empty(0, 0, dtype=torch.int8, device=device)
+            if prepared.block_valid_i8 is None else prepared.block_valid_i8.to(device).contiguous()
+        )
+        block_obj.static_block_token_indices = (
+            torch.empty(0, 0, 0, dtype=torch.long, device=device)
+            if prepared.block_token_indices is None else prepared.block_token_indices.to(device).contiguous()
+        )
+        block_obj.static_block_token_valid_i8 = (
+            torch.empty(0, 0, 0, dtype=torch.int8, device=device)
+            if prepared.block_token_valid_i8 is None else prepared.block_token_valid_i8.to(device).contiguous()
+        )
+        block_obj.static_block_size = prepared.block_size
+        if hasattr(block_obj.attn, "triton_block_d"):
+            block_obj.attn.triton_block_d = triton_block_d
+            block_obj.attn.triton_block_k = triton_block_k
 
-    def _profile_once() -> dict[str, float]:
+    _install_prepared_static(hand_block, hand_prepared, hand_triton_block_d, hand_triton_block_k)
+    _install_prepared_static(learned_block, learned_prepared, learned_triton_block_d, learned_triton_block_k)
+
+    def _profile_once(block_obj: MathRoutedTransformerBlock) -> dict[str, float]:
         with torch.no_grad():
-            _, timings = block.profile_cached_sparse_block(x_dm, nodes, env=env or None)
+            _, timings = block_obj.profile_cached_sparse_block(
+                x_dm, nodes, env=env or None,
+                fused_norm_qkv=profile_fused_norm_qkv,
+                fused_attn_outproj=profile_fused_attn_outproj,
+            )
         return timings
 
     hand_samples: list[dict[str, float]] = []
     learned_samples: list[dict[str, float]] = []
     with torch.no_grad():
         for _ in range(n_warmup):
-            _install_prepared(hand_prepared, hand_triton_block_d, hand_triton_block_k)
-            _profile_once()
-            _install_prepared(learned_prepared, learned_triton_block_d, learned_triton_block_k)
-            _profile_once()
+            _profile_once(hand_block)
+            _profile_once(learned_block)
         for _ in range(n_iter):
-            _install_prepared(hand_prepared, hand_triton_block_d, hand_triton_block_k)
-            hand_samples.append(_profile_once())
-            _install_prepared(learned_prepared, learned_triton_block_d, learned_triton_block_k)
-            learned_samples.append(_profile_once())
+            hand_samples.append(_profile_once(hand_block))
+            learned_samples.append(_profile_once(learned_block))
 
     bucket_keys = [
         "topology_prepare_ms",
         "norm1_ms",
         "qkv_ms",
+        "norm_qkv_ms",
         "attention_kernel_ms",
         "out_proj_ms",
+        "attention_outproj_ms",
+        "native_block_backend_triton",
+        "native_block_backend_vectorized",
         "residual1_ms",
         "norm2_ms",
         "ffn_ms",
@@ -924,16 +1049,38 @@ def run_paired_learned_topology_benchmark(
         buckets: dict[str, float],
         triton_block_d: int | None,
         triton_block_k: int | None,
+        prepare_timing: dict[str, float],
     ) -> BenchmarkReport:
         diag = prepared.diagnostics
         total = float(buckets.get("total_block_ms", 0.0))
-        attn = float(buckets.get("attention_kernel_ms", 0.0))
+        attn_outproj = float(buckets.get("attention_outproj_ms", 0.0) or 0.0)
+        attn_kernel = float(buckets.get("attention_kernel_ms", 0.0) or 0.0)
+        attn = attn_outproj if attn_outproj > 0.0 else attn_kernel
         non_attn = max(0.0, total - attn)
+        topology_prepare_ms = float(prepare_timing.get("topology_prepare_ms", 0.0))
+        learned_scorer_ms = float(prepare_timing.get("learned_scorer_ms", 0.0))
+        neighbor_table_build_ms = float(prepare_timing.get("neighbor_table_build_ms", 0.0))
+        total_with_prepare_ms = topology_prepare_ms + total
         selector_results = {
             "paired_prepared_shared_block": {
                 **{k: float(v) for k, v in buckets.items()},
+                "topology_prepare_ms": topology_prepare_ms,
+                "learned_scorer_ms": learned_scorer_ms,
+                "neighbor_table_build_ms": neighbor_table_build_ms,
+                "prepared_block_ms": total,
+                "prepared_attention_ms": attn,
+                "prepared_non_attention_ms": non_attn,
+                "total_with_prepare_ms": total_with_prepare_ms,
                 "same_block_weights": 1.0,
                 "same_input": 1.0,
+                "profile_fused_norm_qkv": float(profile_fused_norm_qkv),
+                "profile_fused_attn_outproj": float(profile_fused_attn_outproj),
+                "native_block_sparse_attn": float(native_block_sparse_attn and prepared.is_block_topology),
+                "block_count": float(prepared.block_neighbors.shape[0]) if prepared.block_neighbors is not None else 0.0,
+                "block_size": float(prepared.block_size or 0),
+                "topk_blocks": float(prepared.block_neighbors.shape[1]) if prepared.block_neighbors is not None else 0.0,
+                "block_token_cap": float(prepared.block_token_indices.shape[2]) if prepared.block_token_indices is not None else 0.0,
+                "native_effective_token_k": float(prepared.block_token_indices.shape[1] * prepared.block_token_indices.shape[2]) if prepared.block_token_indices is not None else 0.0,
             }
         }
         return BenchmarkReport(
@@ -957,12 +1104,18 @@ def run_paired_learned_topology_benchmark(
             prepared_static_sparse_block_ms=total,
             prepared_static_sparse_attention_ms=attn,
             prepared_static_sparse_non_attention_ms=non_attn,
+            topology_prepare_ms=topology_prepare_ms,
+            learned_scorer_ms=learned_scorer_ms,
+            neighbor_table_build_ms=neighbor_table_build_ms,
+            total_with_prepare_ms=total_with_prepare_ms,
+            profile_fused_norm_qkv=profile_fused_norm_qkv,
+            profile_fused_attn_outproj=profile_fused_attn_outproj,
             selector_results=selector_results,
             by_relation=diag.by_relation,
         )
 
-    hand_report = _make_report(hand_prepared, hand_buckets, hand_triton_block_d, hand_triton_block_k)
-    learned_report = _make_report(learned_prepared, learned_buckets, learned_triton_block_d, learned_triton_block_k)
+    hand_report = _make_report(hand_prepared, hand_buckets, hand_triton_block_d, hand_triton_block_k, hand_prepare_timing)
+    learned_report = _make_report(learned_prepared, learned_buckets, learned_triton_block_d, learned_triton_block_k, learned_prepare_timing)
 
     if hand_save_dir:
         _save_report(hand_report, hand_save_dir)
@@ -988,11 +1141,16 @@ def run_quality_eval(
     relation_weights: dict[str, float] | None = None,
     learned_scorer_checkpoint: str | None = None,
     learned_k: int = 8,
+    block_size: int = 64,
+    topk_blocks: int = 4,
+    block_local_window: int = 1,
+    block_token_cap: int = 16,
 ) -> list[QualityReport]:
     from .model import MathRoutedTransformer
     from .parser import parse
     from .normalize import normalize
     from .learned_topology_runtime import LearnedTopologyBuilder
+    from .block_learned_topology import HeuristicBlockTopologyBuilder
 
     records = _load_route_eval_records(examples_path)
     if not records:
@@ -1005,6 +1163,7 @@ def run_quality_eval(
         if dev.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested for quality eval but CUDA is not available")
     torch.manual_seed(0)
+    base_topology_mode = "middle_preserving_topk" if topology_mode == "learned_block_topk" else topology_mode
     base_kwargs = dict(
         d_model=d_model,
         n_heads=n_heads,
@@ -1146,6 +1305,50 @@ def run_quality_eval(
                 logit_l1=agreement["logit_l1"],
                 logit_kl_dense_to_sparse=agreement["logit_kl_dense_to_sparse"],
                 by_expert=_by_expert(sparse_preds),
+            )
+        )
+
+    if topology_mode == "learned_block_topk":
+        block_model = MathRoutedTransformer(
+            **base_kwargs,
+            attention_mode="neighbor_sparse",
+            max_neighbors=learned_k,
+            share_topology_cache=True,
+            sparse_selector="topology_only",
+        ).to(dev)
+        block_model.load_state_dict(dense_state)
+        for layer in block_model.layers:
+            layer.topology = HeuristicBlockTopologyBuilder(
+                block_size=block_size,
+                topk_blocks=topk_blocks,
+                include_local_blocks=block_local_window,
+                block_token_cap=block_token_cap,
+                fixed_k=learned_k,
+                topk=topk,
+                local_window=local_window,
+                middle_bridge_width=middle_bridge_width,
+                device=dev,
+            )
+            layer.max_neighbors = learned_k
+        block_preds, block_hiddens, block_logits = _forward_records(block_model, pass_nodes=True)
+        agreement = _agreement_metrics(
+            sparse_hiddens=block_hiddens,
+            sparse_logits=block_logits,
+            dense_hiddens=dense_hiddens,
+            dense_logits=dense_logits,
+        )
+        reports.append(
+            QualityReport(
+                mode="learned_block_topk",
+                k=learned_k,
+                n_examples=len(records),
+                route_accuracy=op_accuracy(block_preds, targets),
+                dense_agreement=op_accuracy(block_preds, dense_preds),
+                hidden_l1=agreement["hidden_l1"],
+                hidden_cos=agreement["hidden_cos"],
+                logit_l1=agreement["logit_l1"],
+                logit_kl_dense_to_sparse=agreement["logit_kl_dense_to_sparse"],
+                by_expert=_by_expert(block_preds),
             )
         )
 
@@ -1296,8 +1499,17 @@ def _run_paired_learned_topology_benchmark_cli(args: argparse.Namespace) -> None
         benchmark_seed=args.benchmark_seed,
         hand_save_dir=args.hand_save_dir,
         learned_save_dir=args.learned_save_dir,
+        profile_fused_norm_qkv=args.profile_fused_norm_qkv,
+        profile_fused_attn_outproj=args.profile_fused_attn_outproj,
+        topology_mode=args.topology_mode,
+        block_size=args.block_size,
+        topk_blocks=args.topk_blocks,
+        block_local_window=args.block_local_window,
+        block_token_cap=args.block_token_cap,
+        native_block_sparse_attn=args.native_block_sparse_attn,
     )
     print("paired_prepared_shared_block=true same_input=true same_block_weights=true")
+    print(f"fused_norm_qkv={args.profile_fused_norm_qkv} fused_attn_outproj={args.profile_fused_attn_outproj} native_block_sparse_attn={args.native_block_sparse_attn}")
     print("hand")
     print(hand_report)
     print("learned")
@@ -1337,6 +1549,8 @@ def _run_benchmark_cli(args: argparse.Namespace) -> None:
                 selector_beta=args.selector_beta,
                 selector_candidate_neighbors=args.selector_candidate_neighbors,
                 profile_prepared_block=args.profile_prepared_block,
+                profile_fused_norm_qkv=args.profile_fused_norm_qkv,
+                profile_fused_attn_outproj=args.profile_fused_attn_outproj,
                 learned_scorer_checkpoint=args.learned_scorer_checkpoint,
                 learned_k=args.learned_k,
                 triton_block_d=args.triton_block_d,
@@ -1368,6 +1582,10 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
         relation_weights=relation_weights,
         learned_scorer_checkpoint=args.learned_scorer_checkpoint,
         learned_k=args.learned_k,
+        block_size=args.block_size,
+        topk_blocks=args.topk_blocks,
+        block_local_window=args.block_local_window,
+        block_token_cap=args.block_token_cap,
     )
     print(f"examples={args.examples}  checkpoint={args.checkpoint or 'random_init'}")
     for report in reports:
@@ -1379,6 +1597,9 @@ def main() -> None:
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--paired-learned-topology-benchmark", action="store_true", dest="paired_learned_topology_benchmark")
     parser.add_argument('--profile-prepared-block', action="store_true", dest="profile_prepared_block")
+    parser.add_argument("--profile-fused-norm-qkv", action="store_true", dest="profile_fused_norm_qkv")
+    parser.add_argument("--profile-fused-attn-outproj", action="store_true", dest="profile_fused_attn_outproj")
+    parser.add_argument("--native-block-sparse-attn", action="store_true", dest="native_block_sparse_attn")
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--sizes", default="8,16,32")
     parser.add_argument("--node-mode", default="roots,trees", dest="node_mode")
@@ -1390,7 +1611,7 @@ def main() -> None:
     parser.add_argument("--local-window", type=int, default=1, dest="local_window")
     parser.add_argument("--max-neighbors", type=int, default=DEFAULT_MAX_NEIGHBORS, dest="max_neighbors")
     parser.add_argument("--topology-mode", default="union", dest="topology_mode",
-                        choices=["union", "scored_topk", "middle_preserving_topk", "learned_topology"])
+                        choices=["union", "scored_topk", "middle_preserving_topk", "learned_topology", "learned_block_topk"])
     parser.add_argument("--fixed-k", type=int, default=32, dest="fixed_k")
     parser.add_argument("--middle-bridge-width", type=int, default=0, dest="middle_bridge_width")
     parser.add_argument("--selector-alpha", type=float, default=1.0, dest="selector_alpha")
@@ -1410,6 +1631,10 @@ def main() -> None:
     parser.add_argument("--relation-weights-json", default=None, dest="relation_weights_json")
     parser.add_argument("--learned-scorer-checkpoint", default=None, dest="learned_scorer_checkpoint")
     parser.add_argument("--learned-k", type=int, default=8, dest="learned_k")
+    parser.add_argument("--block-size", type=int, default=64, dest="block_size")
+    parser.add_argument("--topk-blocks", type=int, default=4, dest="topk_blocks")
+    parser.add_argument("--block-local-window", type=int, default=1, dest="block_local_window")
+    parser.add_argument("--block-token-cap", type=int, default=16, dest="block_token_cap")
     parser.add_argument("--triton-block-d", type=int, default=None, dest="triton_block_d")
     parser.add_argument("--triton-block-k", type=int, default=None, dest="triton_block_k")
     parser.add_argument("--benchmark-seed", type=int, default=None, dest="benchmark_seed")

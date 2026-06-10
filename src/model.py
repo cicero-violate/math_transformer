@@ -11,11 +11,11 @@ from .ir import MathNode
 from .embedder import MathEmbedder, EMBED_DIM
 from .topology import TopologyBuilder, MaskDiagnostics
 from .topology_cache import TopologyCache, CachedTopology, PreparedTopology
-from .attention import DenseMaskedMathAttention, NeighborSparseMathAttention, SparseSelectorMode
+from .attention import DenseMaskedMathAttention, NeighborSparseMathAttention, BlockSparseMathAttention, SparseSelectorMode
 from .sparse_attention import symbolic_priority_scores
 from .router import OperatorRouter, RouteResult
 
-AttentionMode = Literal["full", "dense_masked", "neighbor_sparse"]
+AttentionMode = Literal["full", "dense_masked", "neighbor_sparse", "block_sparse"]
 DEFAULT_MAX_NEIGHBORS = 16
 
 
@@ -60,6 +60,11 @@ class MathRoutedTransformerBlock(nn.Module):
         self._prepared_topology: PreparedTopology | None = None
         self.register_buffer("static_neighbors", torch.empty(0, 0, dtype=torch.long), persistent=False)
         self.register_buffer("static_valid_i8", torch.empty(0, 0, dtype=torch.int8), persistent=False)
+        self.register_buffer("static_block_neighbors", torch.empty(0, 0, dtype=torch.long), persistent=False)
+        self.register_buffer("static_block_valid_i8", torch.empty(0, 0, dtype=torch.int8), persistent=False)
+        self.register_buffer("static_block_token_indices", torch.empty(0, 0, 0, dtype=torch.long), persistent=False)
+        self.register_buffer("static_block_token_valid_i8", torch.empty(0, 0, 0, dtype=torch.int8), persistent=False)
+        self.static_block_size: int | None = None
 
         if attention_mode == "neighbor_sparse":
             self.attn = NeighborSparseMathAttention(
@@ -67,6 +72,8 @@ class MathRoutedTransformerBlock(nn.Module):
                 triton_block_d=triton_block_d,
                 triton_block_k=triton_block_k,
             )
+        elif attention_mode == "block_sparse":
+            self.attn = BlockSparseMathAttention(d_model, n_heads, dropout)
         else:
             self.attn = DenseMaskedMathAttention(d_model, n_heads, dropout)
 
@@ -106,6 +113,23 @@ class MathRoutedTransformerBlock(nn.Module):
         self._prepared_topology = prepared
         self.static_neighbors = prepared.neighbors.to(dev).contiguous()
         self.static_valid_i8 = prepared.valid_i8.to(dev).contiguous()
+        if prepared.block_neighbors is not None:
+            self.static_block_neighbors = prepared.block_neighbors.to(dev).contiguous()
+        else:
+            self.static_block_neighbors = torch.empty(0, 0, dtype=torch.long, device=dev)
+        if prepared.block_valid_i8 is not None:
+            self.static_block_valid_i8 = prepared.block_valid_i8.to(dev).contiguous()
+        else:
+            self.static_block_valid_i8 = torch.empty(0, 0, dtype=torch.int8, device=dev)
+        if prepared.block_token_indices is not None:
+            self.static_block_token_indices = prepared.block_token_indices.to(dev).contiguous()
+        else:
+            self.static_block_token_indices = torch.empty(0, 0, 0, dtype=torch.long, device=dev)
+        if prepared.block_token_valid_i8 is not None:
+            self.static_block_token_valid_i8 = prepared.block_token_valid_i8.to(dev).contiguous()
+        else:
+            self.static_block_token_valid_i8 = torch.empty(0, 0, 0, dtype=torch.int8, device=dev)
+        self.static_block_size = prepared.block_size
         return prepared
 
     def _prepared_or_cached_topology(
@@ -151,36 +175,60 @@ class MathRoutedTransformerBlock(nn.Module):
         env: dict[str, tuple[int, ...]] | None = None,
     ) -> torch.Tensor:
         nb, valid_i8, _prepared = self._prepared_or_cached_topology(x, nodes, env)
-        symbolic_scores = None
-        attn_out = self.attn.forward_fused_norm_qkv(
-            x, self.norm1, nb, valid_i8,
-            selector_mode=self.sparse_selector,
-            symbolic_scores=symbolic_scores,
-            selector_alpha=self.selector_alpha,
-            selector_beta=self.selector_beta,
-            selector_k=self.selector_k,
-        )
+        if self.attention_mode == "block_sparse":
+            if _prepared is None or not _prepared.is_block_topology or _prepared.block_neighbors is None or _prepared.block_size is None:
+                raise RuntimeError("block_sparse attention requires prepared block topology")
+            attn_out = self.attn(
+                self.norm1(x),
+                _prepared.block_neighbors,
+                _prepared.block_valid_i8,
+                _prepared.block_size,
+                block_token_indices=_prepared.block_token_indices,
+                block_token_valid_i8=_prepared.block_token_valid_i8,
+            )
+        else:
+            symbolic_scores = None
+            attn_out = self.attn.forward_fused_norm_qkv(
+                x, self.norm1, nb, valid_i8,
+                selector_mode=self.sparse_selector,
+                symbolic_scores=symbolic_scores,
+                selector_alpha=self.selector_alpha,
+                selector_beta=self.selector_beta,
+                selector_k=self.selector_k,
+            )
         x = x.add(self._maybe_residual_dropout(attn_out))
         return x.add(self._maybe_residual_dropout(self._ff_block(self.norm2(x))))
 
     def forward_static_fast_path(self, x: torch.Tensor) -> torch.Tensor:
         """Run inference using already-prepared static topology buffers."""
-        if self.attention_mode != "neighbor_sparse":
-            raise RuntimeError("forward_static_fast_path requires neighbor_sparse attention")
+        if self.attention_mode not in ("neighbor_sparse", "block_sparse"):
+            raise RuntimeError("forward_static_fast_path requires sparse attention")
         if self.static_neighbors.numel() == 0 or self.static_valid_i8.numel() == 0:
             raise RuntimeError("forward_static_fast_path requires prepare_static_topology first")
         if self.static_neighbors.shape[0] != x.shape[1]:
             raise RuntimeError("static topology length does not match input sequence length")
         if self.static_neighbors.device != x.device:
             raise RuntimeError("static topology device does not match input device")
-        attn_out = self.attn.forward_fused_norm_qkv(
-            x, self.norm1, self.static_neighbors, self.static_valid_i8,
-            selector_mode=self.sparse_selector,
-            symbolic_scores=None,
-            selector_alpha=self.selector_alpha,
-            selector_beta=self.selector_beta,
-            selector_k=self.selector_k,
-        )
+        if self.attention_mode == "block_sparse":
+            if self.static_block_neighbors.numel() == 0 or self.static_block_valid_i8.numel() == 0 or self.static_block_size is None:
+                raise RuntimeError("block_sparse static path requires block topology fields")
+            attn_out = self.attn(
+                self.norm1(x),
+                self.static_block_neighbors,
+                self.static_block_valid_i8,
+                self.static_block_size,
+                block_token_indices=self.static_block_token_indices if self.static_block_token_indices.numel() else None,
+                block_token_valid_i8=self.static_block_token_valid_i8 if self.static_block_token_valid_i8.numel() else None,
+            )
+        else:
+            attn_out = self.attn.forward_fused_norm_qkv(
+                x, self.norm1, self.static_neighbors, self.static_valid_i8,
+                selector_mode=self.sparse_selector,
+                symbolic_scores=None,
+                selector_alpha=self.selector_alpha,
+                selector_beta=self.selector_beta,
+                selector_k=self.selector_k,
+            )
         x = x.add(self._maybe_residual_dropout(attn_out))
         return x.add(self._maybe_residual_dropout(self._ff_block(self.norm2(x))))
 
@@ -200,6 +248,13 @@ class MathRoutedTransformerBlock(nn.Module):
         """
         B, T, _ = x.shape
         if (
+            self.attention_mode == "block_sparse"
+            and not return_metadata
+            and nodes is not None
+            and len(nodes) == T
+        ):
+            return self.forward_cached_fast_path(x, nodes, env), None, None, None
+        if (
             self.attention_mode == "neighbor_sparse"
             and not return_metadata
             and nodes is not None
@@ -210,6 +265,28 @@ class MathRoutedTransformerBlock(nn.Module):
         mask: torch.Tensor | None = None
         route_info: list[RouteResult] | None = None
         diag: MaskDiagnostics | None = None
+
+        if self.attention_mode == "block_sparse" and nodes is not None and len(nodes) == T:
+            cache = self._topology_cache if self._topology_cache is not None else TopologyCache(maxsize=1)
+            z = cache.get_or_encode(nodes, self.embedder)
+            prepared = cache.get_or_prepare(
+                nodes, z, env, self.topology, self.max_neighbors, device=x.device
+            )
+            if not prepared.is_block_topology or prepared.block_neighbors is None or prepared.block_size is None:
+                raise RuntimeError("block_sparse attention requires a block topology builder")
+            diag = prepared.diagnostics if return_metadata else None
+            route_info = self.router.route_batch(nodes, z) if return_metadata else None
+            attn_out = self.attn(
+                self.norm1(x),
+                prepared.block_neighbors,
+                prepared.block_valid_i8,
+                prepared.block_size,
+                block_token_indices=prepared.block_token_indices,
+                block_token_valid_i8=prepared.block_token_valid_i8,
+            )
+            x = x + self._maybe_residual_dropout(attn_out)
+            x = x + self._maybe_residual_dropout(self._ff_block(self.norm2(x)))
+            return x, None, route_info, diag
 
         if nodes is not None and len(nodes) == T and self.attention_mode != "full":
             # Do not use `or` here: TopologyCache implements __len__, so an
@@ -267,10 +344,17 @@ class MathRoutedTransformerBlock(nn.Module):
         x: torch.Tensor,
         nodes: list[MathNode],
         env: dict[str, tuple[int, ...]] | None = None,
+        fused_norm_qkv: bool = False,
+        fused_attn_outproj: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Profile the topology-only sparse block with coarse timing buckets."""
-        if self.attention_mode != "neighbor_sparse":
-            raise RuntimeError("profile_cached_sparse_block requires neighbor_sparse attention")
+        """Profile the topology-only sparse block with coarse timing buckets.
+
+        The optional fused flags keep the prepared benchmark auditable by
+        replacing separate bucket pairs with the corresponding fused bucket
+        when the CUDA/Triton fast path is available.
+        """
+        if self.attention_mode not in ("neighbor_sparse", "block_sparse"):
+            raise RuntimeError("profile_cached_sparse_block requires sparse attention")
         if self.sparse_selector != "topology_only":
             raise RuntimeError("profile_cached_sparse_block currently supports topology_only only")
 
@@ -287,29 +371,76 @@ class MathRoutedTransformerBlock(nn.Module):
         timings: dict[str, float] = {}
         sync()
         t = time.perf_counter()
-        nb, valid_i8, _ = self._prepared_or_cached_topology(x, nodes, env)
+        nb, valid_i8, prepared = self._prepared_or_cached_topology(x, nodes, env)
         t = mark(t, "topology_prepare_ms", timings)
-
-        x1 = self.norm1(x)
-        t = mark(t, "norm1_ms", timings)
-        q, k, v = self.attn.project_qkv_for_profile(x1)
-        t = mark(t, "qkv_ms", timings)
 
         from .triton_attention import triton_neighbor_attention_flat, TRITON_AVAILABLE
         from .sparse_attention import neighbor_attention
-        if TRITON_AVAILABLE and x.is_cuda:
-            attn_raw = triton_neighbor_attention_flat(
-                q, k, v, nb, valid_i8,
-                block_d=self.attn.triton_block_d,
-                block_k=self.attn.triton_block_k,
-            )
+
+        use_fused_norm_qkv = bool(fused_norm_qkv and TRITON_AVAILABLE and x.is_cuda and not self.training)
+        use_fused_attn_outproj = bool(fused_attn_outproj and TRITON_AVAILABLE and x.is_cuda and not self.training)
+
+        if use_fused_norm_qkv:
+            q, k, v = self.attn.project_norm_qkv_for_profile(x, self.norm1)
+            t = mark(t, "norm_qkv_ms", timings)
         else:
-            attn_raw = neighbor_attention(q, k, v, nb, valid_i8.bool())
-            B, T, _ = x.shape
-            attn_raw = attn_raw.transpose(1, 2).reshape(B, T, self.attn.d_model)
-        t = mark(t, "attention_kernel_ms", timings)
-        attn_out = self.attn.out_project_for_profile(attn_raw)
-        t = mark(t, "out_proj_ms", timings)
+            x1 = self.norm1(x)
+            t = mark(t, "norm1_ms", timings)
+            q, k, v = self.attn.project_qkv_for_profile(x1)
+            t = mark(t, "qkv_ms", timings)
+
+        if self.attention_mode == "block_sparse":
+            if prepared is None or not prepared.is_block_topology or prepared.block_neighbors is None or prepared.block_size is None:
+                raise RuntimeError("block_sparse profiling requires prepared block topology")
+            if use_fused_attn_outproj:
+                attn_out = self.attn.attention_out_project_for_profile(
+                    q, k, v, prepared.block_neighbors, prepared.block_valid_i8, prepared.block_size,
+                    block_token_indices=prepared.block_token_indices,
+                    block_token_valid_i8=prepared.block_token_valid_i8,
+                )
+                try:
+                    from .block_sparse_attention import block_sparse_attention_last_backend
+                    backend = block_sparse_attention_last_backend()
+                except Exception:
+                    backend = "unknown"
+                timings["native_block_backend_triton"] = 1.0 if backend == "triton" else 0.0
+                timings["native_block_backend_vectorized"] = 1.0 if backend == "vectorized" else 0.0
+                t = mark(t, "attention_outproj_ms", timings)
+            else:
+                attn_raw_bhtd = self.attn.block_attention_for_profile(
+                    q, k, v, prepared.block_neighbors, prepared.block_valid_i8, prepared.block_size,
+                    block_token_indices=prepared.block_token_indices,
+                    block_token_valid_i8=prepared.block_token_valid_i8,
+                )
+                try:
+                    from .block_sparse_attention import block_sparse_attention_last_backend
+                    backend = block_sparse_attention_last_backend()
+                except Exception:
+                    backend = "unknown"
+                timings["native_block_backend_triton"] = 1.0 if backend == "triton" else 0.0
+                timings["native_block_backend_vectorized"] = 1.0 if backend == "vectorized" else 0.0
+                t = mark(t, "attention_kernel_ms", timings)
+                Bp, Hp, Tp, Dp = attn_raw_bhtd.shape
+                attn_raw = attn_raw_bhtd.transpose(1, 2).contiguous().reshape(Bp, Tp, Hp * Dp)
+                attn_out = self.attn.out_project_for_profile(attn_raw)
+                t = mark(t, "out_proj_ms", timings)
+        elif use_fused_attn_outproj:
+            attn_out = self.attn.attention_out_project_for_profile(q, k, v, nb, valid_i8)
+            t = mark(t, "attention_outproj_ms", timings)
+        else:
+            if TRITON_AVAILABLE and x.is_cuda:
+                attn_raw = triton_neighbor_attention_flat(
+                    q, k, v, nb, valid_i8,
+                    block_d=self.attn.triton_block_d,
+                    block_k=self.attn.triton_block_k,
+                )
+            else:
+                attn_raw = neighbor_attention(q, k, v, nb, valid_i8.bool())
+                B, T, _ = x.shape
+                attn_raw = attn_raw.transpose(1, 2).reshape(B, T, self.attn.d_model)
+            t = mark(t, "attention_kernel_ms", timings)
+            attn_out = self.attn.out_project_for_profile(attn_raw)
+            t = mark(t, "out_proj_ms", timings)
         y = x.add(self._maybe_residual_dropout(attn_out))
         t = mark(t, "residual1_ms", timings)
         y2 = self.norm2(y)
@@ -318,7 +449,20 @@ class MathRoutedTransformerBlock(nn.Module):
         t = mark(t, "ffn_ms", timings)
         out = y.add(self._maybe_residual_dropout(ff))
         t = mark(t, "residual2_ms", timings)
-        timings["total_block_ms"] = sum(timings.values())
+        duration_keys = (
+            "topology_prepare_ms",
+            "norm1_ms",
+            "qkv_ms",
+            "norm_qkv_ms",
+            "attention_kernel_ms",
+            "out_proj_ms",
+            "attention_outproj_ms",
+            "residual1_ms",
+            "norm2_ms",
+            "ffn_ms",
+            "residual2_ms",
+        )
+        timings["total_block_ms"] = sum(float(timings.get(k, 0.0)) for k in duration_keys)
         return out, timings
 
 

@@ -12,8 +12,9 @@ from .topology import (
     shape_compatibility_matrix,
 )
 from .shape import infer_shape, infer_tree, ShapeError
-from .attention import DenseMaskedMathAttention, MathRoutedAttention, FullAttention, math_attention
+from .attention import DenseMaskedMathAttention, BlockSparseMathAttention, MathRoutedAttention, FullAttention, math_attention
 from .sparse_attention import neighbor_attention, neighbors_from_mask, max_k_from_mask
+from .block_sparse_attention import block_sparse_attention_reference, block_sparse_attention_fast, block_neighbors_to_dense_mask
 from .router import OperatorRouter, RouteResult, EXPERT_NAMES
 from .verifier import Verifier, ExecutionPlan, VerificationResult
 from .tasks import EXPERT_TO_ID, ID_TO_EXPERT, N_EXPERTS
@@ -40,9 +41,10 @@ __all__ = [
     # shape
     "infer_shape", "infer_tree", "ShapeError",
     # attention
-    "DenseMaskedMathAttention", "MathRoutedAttention", "FullAttention", "math_attention",
+    "DenseMaskedMathAttention", "BlockSparseMathAttention", "MathRoutedAttention", "FullAttention", "math_attention",
     # sparse attention
     "neighbor_attention", "neighbors_from_mask", "max_k_from_mask",
+    "block_sparse_attention_reference", "block_sparse_attention_fast", "block_neighbors_to_dense_mask",
     # router
     "OperatorRouter", "RouteResult", "EXPERT_NAMES",
     # verifier
