@@ -313,6 +313,7 @@ def run_logit_bias_training_loop(
             lr=lr,
             bias=bias,
             temperature=temperature,
+            device=device,
         )
         history.append(
             {
@@ -362,6 +363,7 @@ def run_logit_bias_training_loop(
         "train_steps": train_steps,
         "projection_seed": projection_seed,
         "temperature": step["temperature"],
+        "device": device,
         "lr": step["lr"],
         "vocab_size": step["vocab_size"],
         "row_count": step["row_count"],
@@ -398,6 +400,7 @@ def run_and_write_logit_bias_training_report(
     projection_seed: int = 0,
     lr: float = 0.1,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     report = run_logit_bias_training_loop(
         eval_output_dir,
@@ -410,6 +413,7 @@ def run_and_write_logit_bias_training_report(
         projection_seed=projection_seed,
         lr=lr,
         temperature=temperature,
+        device=device,
     )
     write_logit_bias_training_report(report, output_path)
     return report

@@ -126,6 +126,30 @@ def test_logit_bias_training_loop_reduces_kl(tmp_path):
     assert report["finite"] is True
 
 
+def test_logit_bias_training_loop_threads_device(tmp_path):
+    out, targets = _build_eval_and_logit_targets(tmp_path)
+    report = run_logit_bias_training_loop(out, targets, k=1, train_steps=2, lr=0.1, device="torch_cpu")
+    assert report["status"] == "logit_bias_training_loop_ok"
+    assert report["device"] == "torch_cpu"
+    assert report["finite"] is True
+
+
+def test_logit_bias_training_write_helper_threads_device(tmp_path):
+    out, targets = _build_eval_and_logit_targets(tmp_path)
+    report_path = tmp_path / "reports" / "kl_training_torch_cpu.json"
+    report = run_and_write_logit_bias_training_report(
+        out,
+        targets,
+        report_path,
+        k=1,
+        train_steps=2,
+        lr=0.1,
+        device="torch_cpu",
+    )
+    assert report_path.exists()
+    assert report["device"] == "torch_cpu"
+
+
 def test_logit_bias_training_loop_is_deterministic(tmp_path):
     out, targets = _build_eval_and_logit_targets(tmp_path)
     first = run_logit_bias_training_loop(out, targets, k=1, train_steps=5, lr=0.1)
