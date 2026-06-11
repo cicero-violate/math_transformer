@@ -8,6 +8,78 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+
+_RUNTIME_DEVICES = {"cpu", "torch_cpu", "cuda", "auto"}
+
+
+def _torch_module():
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return None
+    return torch
+
+
+def resolve_runtime_device(device: str = "cpu") -> dict[str, Any]:
+    if device not in _RUNTIME_DEVICES:
+        raise ValueError(f"device must be one of {sorted(_RUNTIME_DEVICES)}, got {device!r}")
+    torch = _torch_module()
+    torch_available = torch is not None
+    cuda_available = bool(torch_available and torch.cuda.is_available())
+    if device == "cpu":
+        return {
+            "requested_device": device,
+            "resolved_device": "cpu",
+            "runtime_backend": "python",
+            "torch_available": torch_available,
+            "cuda_available": cuda_available,
+        }
+    if device == "torch_cpu":
+        if torch is None:
+            raise ValueError("torch_cpu device requires torch")
+        return {
+            "requested_device": device,
+            "resolved_device": "cpu",
+            "runtime_backend": "torch",
+            "torch_available": True,
+            "cuda_available": cuda_available,
+        }
+    if device == "cuda":
+        if torch is None:
+            raise ValueError("cuda device requires torch")
+        if not cuda_available:
+            raise ValueError("cuda device requested but torch.cuda.is_available() is false")
+        return {
+            "requested_device": device,
+            "resolved_device": "cuda",
+            "runtime_backend": "torch",
+            "torch_available": True,
+            "cuda_available": True,
+        }
+    if torch is not None and cuda_available:
+        return {
+            "requested_device": device,
+            "resolved_device": "cuda",
+            "runtime_backend": "torch",
+            "torch_available": True,
+            "cuda_available": True,
+        }
+    if torch is not None:
+        return {
+            "requested_device": device,
+            "resolved_device": "cpu",
+            "runtime_backend": "torch",
+            "torch_available": True,
+            "cuda_available": False,
+        }
+    return {
+        "requested_device": device,
+        "resolved_device": "cpu",
+        "runtime_backend": "python",
+        "torch_available": False,
+        "cuda_available": False,
+    }
+
 from src.qwen_sparse_student_handoff import load_selected_adjacency, validate_selected_adjacency
 
 _TARGET_MODES = {"identity", "zero", "scaled_identity"}
@@ -97,6 +169,50 @@ def _propagate_once(
     return next_features
 
 
+def _propagate_torch(
+    input_features: dict[str, list[float]],
+    adjacency_index: dict[str, Any],
+    *,
+    steps: int,
+    resolved_device: str,
+    residual: float = 1.0,
+) -> dict[str, list[float]]:
+    torch = _torch_module()
+    if torch is None:
+        raise ValueError("torch runtime backend requires torch")
+    node_ids = list(adjacency_index["node_ids"])
+    node_to_idx = {node_id: idx for idx, node_id in enumerate(node_ids)}
+    features = torch.tensor(
+        [input_features[node_id] for node_id in node_ids],
+        dtype=torch.float64,
+        device=torch.device(resolved_device),
+    )
+    src_indices: list[int] = []
+    dst_indices: list[int] = []
+    weights: list[float] = []
+    for src_id, edges in adjacency_index["outgoing"].items():
+        for edge in edges:
+            src_indices.append(node_to_idx[src_id])
+            dst_indices.append(node_to_idx[str(edge["dst_id"])])
+            weights.append(_as_finite_float(edge["normalized_weight"], field="edge.normalized_weight"))
+    if src_indices:
+        src_idx = torch.tensor(src_indices, dtype=torch.long, device=features.device)
+        dst_idx = torch.tensor(dst_indices, dtype=torch.long, device=features.device)
+        edge_weight = torch.tensor(weights, dtype=features.dtype, device=features.device).unsqueeze(1)
+    else:
+        src_idx = dst_idx = edge_weight = None
+    for _ in range(steps):
+        next_features = residual * features
+        if src_idx is not None and dst_idx is not None and edge_weight is not None:
+            messages = features.index_select(0, src_idx) * edge_weight
+            next_features.index_add_(0, dst_idx, messages)
+        features = next_features
+    if resolved_device == "cuda":
+        torch.cuda.synchronize()
+    rows = features.detach().cpu().tolist()
+    return {node_id: [float(value) for value in vector] for node_id, vector in zip(node_ids, rows)}
+
+
 def _features_are_finite(features: dict[str, list[float]]) -> bool:
     return all(math.isfinite(value) for vector in features.values() for value in vector)
 
@@ -117,6 +233,7 @@ def _forward_summary(
     steps: int,
     input_features: dict[str, list[float]],
     output_features: dict[str, list[float]],
+    device_info: dict[str, Any],
 ) -> dict[str, Any]:
     finite = _features_are_finite(output_features)
     changed_node_count = _changed_node_count(input_features, output_features)
@@ -133,6 +250,11 @@ def _forward_summary(
         "k": adjacency_index["k"],
         "feature_dim": feature_dim,
         "steps": steps,
+        "runtime_backend": device_info["runtime_backend"],
+        "requested_device": device_info["requested_device"],
+        "resolved_device": device_info["resolved_device"],
+        "torch_available": device_info["torch_available"],
+        "cuda_available": device_info["cuda_available"],
         "node_count": adjacency_index["node_count"],
         "edge_count": adjacency_index["edge_count"],
         "max_out_degree": adjacency_index["max_out_degree"],
@@ -153,6 +275,7 @@ def run_fixed_topology_forward_features(
     feature_dim: int = 8,
     steps: int = 1,
     seed: int = 0,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     if feature_dim < 1:
         raise ValueError(f"feature_dim must be >= 1, got {feature_dim}")
@@ -161,12 +284,21 @@ def run_fixed_topology_forward_features(
 
     selected_adjacency = load_selected_adjacency(eval_output_dir, adjacency_name=adjacency_name, k=k)
     adjacency_index = build_adjacency_index(selected_adjacency)
+    device_info = resolve_runtime_device(device)
     node_ids = adjacency_index["node_ids"]
     input_features = initialize_node_features(node_ids, feature_dim, seed=seed)
 
-    output_features = input_features
-    for _ in range(steps):
-        output_features = _propagate_once(output_features, adjacency_index)
+    if device_info["runtime_backend"] == "torch":
+        output_features = _propagate_torch(
+            input_features,
+            adjacency_index,
+            steps=steps,
+            resolved_device=device_info["resolved_device"],
+        )
+    else:
+        output_features = input_features
+        for _ in range(steps):
+            output_features = _propagate_once(output_features, adjacency_index)
 
     return {
         "summary": _forward_summary(
@@ -175,6 +307,7 @@ def run_fixed_topology_forward_features(
             steps=steps,
             input_features=input_features,
             output_features=output_features,
+            device_info=device_info,
         ),
         "input_features": input_features,
         "output_features": output_features,
@@ -189,6 +322,7 @@ def run_fixed_topology_forward(
     feature_dim: int = 8,
     steps: int = 1,
     seed: int = 0,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     return run_fixed_topology_forward_features(
         eval_output_dir,
@@ -197,6 +331,7 @@ def run_fixed_topology_forward(
         feature_dim=feature_dim,
         steps=steps,
         seed=seed,
+        device=device,
     )["summary"]
 
 
@@ -271,6 +406,7 @@ def run_fixed_topology_loss_dry_run(
     seed: int = 0,
     target_mode: str = "identity",
     target_scale: float = 1.0,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     forward = run_fixed_topology_forward_features(
         eval_output_dir,
@@ -279,6 +415,7 @@ def run_fixed_topology_loss_dry_run(
         feature_dim=feature_dim,
         steps=steps,
         seed=seed,
+        device=device,
     )
     target_features = synthetic_target_features(
         forward["input_features"],

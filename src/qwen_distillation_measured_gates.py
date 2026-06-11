@@ -79,7 +79,7 @@ def _collect_checked_artifacts(harness_output_dir: Path, harness_report: dict[st
     return checked
 
 
-def _run_one_measured_training_loop(harness_report: dict[str, Any]) -> tuple[dict[str, Any], float, int]:
+def _run_one_measured_training_loop(harness_report: dict[str, Any], *, device: str = "cpu") -> tuple[dict[str, Any], float, int]:
     eval_output_dir = Path(harness_report["eval_output_dir"])
     logit_targets_dir = Path(harness_report["logit_targets_dir"])
     tracemalloc.start()
@@ -95,6 +95,7 @@ def _run_one_measured_training_loop(harness_report: dict[str, Any]) -> tuple[dic
             projection_seed=int(harness_report["projection_seed"]),
             lr=float(harness_report["lr"]),
             temperature=float(harness_report["temperature"]),
+            device=device,
         )
         elapsed = time.perf_counter() - started
         _current, peak = tracemalloc.get_traced_memory()
@@ -110,6 +111,7 @@ def build_measured_distillation_gate_report(
     max_runtime_seconds: float = 10.0,
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
+    device: str | None = None,
 ) -> dict[str, Any]:
     """Measure task-quality, runtime, and memory gates for a P10 harness output.
 
@@ -128,12 +130,13 @@ def build_measured_distillation_gate_report(
     validate_distillation_harness_report(harness_report)
     checked_artifacts = _collect_checked_artifacts(base, harness_report)
     target_summary = validate_frozen_logit_distillation_targets(harness_report["logit_targets_dir"])
+    measured_device = str(device if device is not None else harness_report.get("device", "cpu"))
 
     measured_reports: list[dict[str, Any]] = []
     durations: list[float] = []
     peak_bytes: list[int] = []
     for _idx in range(runtime_repeats):
-        report, elapsed, peak = _run_one_measured_training_loop(harness_report)
+        report, elapsed, peak = _run_one_measured_training_loop(harness_report, device=measured_device)
         measured_reports.append(report)
         durations.append(elapsed)
         peak_bytes.append(peak)
@@ -194,6 +197,7 @@ def build_measured_distillation_gate_report(
             "runtime_protocol": "perf_counter_bounded_kl_training_loop",
             "memory_protocol": "tracemalloc_peak_bounded_kl_training_loop",
             "runtime_repeats": runtime_repeats,
+            "device": measured_device,
             "target_rows_sha256": target_summary["target_rows_sha256"],
         },
         "quality_gate": {
@@ -333,6 +337,7 @@ def run_and_write_measured_distillation_gate_report(
     max_runtime_seconds: float = 10.0,
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
+    device: str | None = None,
 ) -> dict[str, Any]:
     report = build_measured_distillation_gate_report(
         harness_output_dir,

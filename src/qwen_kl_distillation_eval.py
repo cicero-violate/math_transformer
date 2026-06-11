@@ -157,6 +157,7 @@ def evaluate_kl_against_frozen_logits(
     steps: int = 1,
     projection_seed: int = 0,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     target_summary = validate_frozen_logit_distillation_targets(logit_targets_dir)
     manifest = load_frozen_logit_distillation_targets_manifest(logit_targets_dir)
@@ -184,6 +185,7 @@ def evaluate_kl_against_frozen_logits(
             feature_dim=feature_dim,
             steps=steps,
             seed=int(row["seed"]),
+            device=device,
         )
         student_logits = project_features_to_logits(
             forward["output_features"],
@@ -238,6 +240,7 @@ def evaluate_kl_against_frozen_logits(
         "steps": steps,
         "vocab_size": vocab_size,
         "temperature": temp,
+        "device": device,
         "row_count": len(rows),
         "kl_mean": _mean(kl_values),
         "kl_min": min(kl_values),
@@ -268,6 +271,7 @@ def run_and_write_kl_eval_report(
     steps: int = 1,
     projection_seed: int = 0,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     report = evaluate_kl_against_frozen_logits(
         eval_output_dir,
@@ -278,6 +282,7 @@ def run_and_write_kl_eval_report(
         steps=steps,
         projection_seed=projection_seed,
         temperature=temperature,
+        device=device,
     )
     write_kl_eval_report(report, output_path)
     return report

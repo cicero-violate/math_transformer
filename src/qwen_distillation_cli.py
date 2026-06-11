@@ -137,6 +137,7 @@ def build_final_summary(
         "adjacency_name": harness_report["adjacency_name"],
         "train_steps": int(harness_report["train_steps"]),
         "runtime_repeats": int(measured_gate_report["measurement_protocol"]["runtime_repeats"]),
+        "device": str(measured_gate_report["measurement_protocol"].get("device", harness_report.get("device", "cpu"))),
         "teacher_checkpoint_loaded": False,
         "teacher_inference_runtime_required": False,
         "raw_weight_payload_in_graph": False,
@@ -215,6 +216,7 @@ def run_measured_distillation_pipeline(
     max_runtime_seconds: float = 10.0,
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     out = Path(output_root)
     out.mkdir(parents=True, exist_ok=True)
@@ -256,6 +258,7 @@ def run_measured_distillation_pipeline(
         lr=lr,
         projection_seed=projection_seed,
         temperature=temperature,
+        device=device,
     )
     gate_path = out / DEFAULT_MEASURED_GATE_REPORT_FILENAME
     gate_report = run_and_write_measured_distillation_gate_report(
@@ -265,6 +268,7 @@ def run_measured_distillation_pipeline(
         max_runtime_seconds=max_runtime_seconds,
         max_peak_memory_bytes=max_peak_memory_bytes,
         min_kl_relative_reduction=min_kl_relative_reduction,
+        device=device,
     )
     decision_path = out / MEASURED_PROMOTION_DECISION_FILENAME
     promotion_decision = run_and_write_distillation_promotion_decision(gate_path, decision_path)
@@ -323,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-runtime-seconds", type=_nonnegative_float, default=10.0)
     parser.add_argument("--max-peak-memory-bytes", type=_nonnegative_int, default=128 * 1024 * 1024)
     parser.add_argument("--min-kl-relative-reduction", type=_nonnegative_float, default=0.0)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "torch_cpu", "cuda", "auto"])
     return parser
 
 
@@ -362,6 +367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_runtime_seconds=args.max_runtime_seconds,
             max_peak_memory_bytes=args.max_peak_memory_bytes,
             min_kl_relative_reduction=args.min_kl_relative_reduction,
+            device=args.device,
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
@@ -373,6 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "safety_ok": summary["safety_ok"],
         "promote": summary["promote"],
         "decision": summary["decision"],
+        "device": summary["device"],
         "missing_or_failed_gates": summary["missing_or_failed_gates"],
     }, indent=2, sort_keys=True))
     return 0

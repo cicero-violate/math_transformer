@@ -151,6 +151,28 @@ def test_distillation_cli_can_skip_graph_prior_eval_with_existing_eval_output(tm
     assert summary["promote"] is True
 
 
+def test_distillation_cli_runs_with_torch_cpu_device(tmp_path):
+    g0 = _compile_g0(tmp_path)
+    output_root = tmp_path / "cli_torch_cpu"
+
+    rc = main([
+        "--source-weight-graph-dir",
+        str(g0),
+        *_common_cli_args(output_root),
+        "--device",
+        "torch_cpu",
+    ])
+
+    assert rc == 0
+    summary = json.loads((output_root / FINAL_SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert summary["device"] == "torch_cpu"
+    assert summary["quality_ok"] is True
+    assert summary["runtime_ok"] is True
+    assert summary["memory_ok"] is True
+    assert summary["safety_ok"] is True
+    assert summary["promote"] is True
+
+
 def test_distillation_cli_rejects_bad_args(tmp_path):
     with pytest.raises(SystemExit) as missing_source:
         main(["--output-root", str(tmp_path / "missing")])

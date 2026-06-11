@@ -204,3 +204,40 @@ def test_loss_dry_run_rejects_bad_target_mode_and_scale(tmp_path):
         run_fixed_topology_loss_dry_run(out, k=1, target_mode="teacher")
     with pytest.raises(ValueError, match="target_scale must be finite"):
         run_fixed_topology_loss_dry_run(out, k=1, target_mode="scaled_identity", target_scale=float("nan"))
+
+
+def test_fixed_topology_torch_cpu_matches_python_cpu(tmp_path):
+    out = _build_eval_output(tmp_path)
+    cpu = run_fixed_topology_forward(out, k=1, feature_dim=8, steps=2, seed=123, device="cpu")
+    torch_cpu = run_fixed_topology_forward(out, k=1, feature_dim=8, steps=2, seed=123, device="torch_cpu")
+    assert cpu["runtime_backend"] == "python"
+    assert torch_cpu["runtime_backend"] == "torch"
+    assert torch_cpu["requested_device"] == "torch_cpu"
+    assert torch_cpu["resolved_device"] == "cpu"
+    assert torch_cpu["output_checksum"] == cpu["output_checksum"]
+    assert torch_cpu["input_checksum"] == cpu["input_checksum"]
+    assert torch_cpu["bounded_active_adjacency"] is True
+    assert torch_cpu["teacher_checkpoint_loaded"] is False
+
+
+def test_fixed_topology_auto_uses_available_backend_without_changing_contract(tmp_path):
+    out = _build_eval_output(tmp_path)
+    summary = run_fixed_topology_forward(out, k=1, feature_dim=8, steps=1, seed=123, device="auto")
+    assert summary["requested_device"] == "auto"
+    assert summary["resolved_device"] in {"cpu", "cuda"}
+    assert summary["runtime_backend"] in {"python", "torch"}
+    assert summary["status"] == "fixed_topology_forward_ok"
+    assert summary["bounded_active_adjacency"] is True
+
+
+def test_fixed_topology_cuda_fails_clearly_when_unavailable(tmp_path):
+    import torch
+
+    out = _build_eval_output(tmp_path)
+    if torch.cuda.is_available():
+        summary = run_fixed_topology_forward(out, k=1, feature_dim=8, steps=1, seed=123, device="cuda")
+        assert summary["resolved_device"] == "cuda"
+        assert summary["runtime_backend"] == "torch"
+    else:
+        with pytest.raises(ValueError, match="cuda device requested"):
+            run_fixed_topology_forward(out, k=1, feature_dim=8, steps=1, seed=123, device="cuda")

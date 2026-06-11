@@ -130,6 +130,7 @@ def run_fixed_topology_distillation_harness(
     lr: float = 0.1,
     projection_seed: int = 0,
     temperature: float = 1.0,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     vocab_size, feature_dim, forward_steps, train_steps, lr, temperature = _validate_args(
         vocab_size=vocab_size,
@@ -171,6 +172,7 @@ def run_fixed_topology_distillation_harness(
         steps=forward_steps,
         projection_seed=projection_seed,
         temperature=temperature,
+        device=device,
     )
 
     training_report_path = out_base / "kl_training_report.json"
@@ -221,6 +223,7 @@ def run_fixed_topology_distillation_harness(
         "lr": lr,
         "projection_seed": projection_seed,
         "temperature": float(target_manifest["temperature"]),
+        "device": device,
         "target_row_count": target_summary["row_count"],
         "kl_before": kl_before_report["kl_mean"],
         "kl_after": training_report["kl_final"],

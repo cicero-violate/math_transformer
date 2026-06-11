@@ -113,6 +113,7 @@ def _collect_base_rows(
     steps: int,
     projection_seed: int,
     vocab_size: int,
+    device: str = "cpu",
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for target_row in iter_frozen_logit_target_rows(logit_targets_dir):
@@ -123,6 +124,7 @@ def _collect_base_rows(
             feature_dim=feature_dim,
             steps=steps,
             seed=int(target_row["seed"]),
+            device=device,
         )
         base_logits = project_features_to_logits(forward["output_features"], vocab_size=vocab_size, seed=projection_seed)
         rows.append(
@@ -185,6 +187,7 @@ def _run_logit_bias_train_step_internal(
     lr: float = 0.1,
     bias: list[float] | None = None,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> tuple[dict[str, Any], list[float]]:
     validate_frozen_logit_distillation_targets(logit_targets_dir)
     manifest = load_frozen_logit_distillation_targets_manifest(logit_targets_dir)
@@ -205,6 +208,7 @@ def _run_logit_bias_train_step_internal(
         steps=steps,
         projection_seed=projection_seed,
         vocab_size=vocab_size,
+        device=device,
     )
     before = _score_rows(rows, bias=bias_before, temperature=temp)
     grad_bias = before["grad_bias"]
@@ -231,6 +235,7 @@ def _run_logit_bias_train_step_internal(
         "steps": steps,
         "projection_seed": projection_seed,
         "temperature": temp,
+        "device": device,
         "lr": lr_value,
         "vocab_size": vocab_size,
         "row_count": len(rows),
@@ -260,6 +265,7 @@ def run_logit_bias_train_step(
     lr: float = 0.1,
     bias: list[float] | None = None,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     report, _bias_after = _run_logit_bias_train_step_internal(
         eval_output_dir,
@@ -272,6 +278,7 @@ def run_logit_bias_train_step(
         lr=lr,
         bias=bias,
         temperature=temperature,
+        device=device,
     )
     return report
 
@@ -288,6 +295,7 @@ def run_logit_bias_training_loop(
     projection_seed: int = 0,
     lr: float = 0.1,
     temperature: float | None = None,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     if train_steps < 1:
         raise ValueError(f"train_steps must be >= 1, got {train_steps}")
