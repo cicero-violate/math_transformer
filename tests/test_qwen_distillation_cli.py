@@ -161,11 +161,16 @@ def test_distillation_cli_runs_with_torch_cpu_device(tmp_path):
         *_common_cli_args(output_root),
         "--device",
         "torch_cpu",
+        "--max-cuda-peak-memory-bytes",
+        str(128 * 1024 * 1024),
     ])
 
     assert rc == 0
     summary = json.loads((output_root / FINAL_SUMMARY_FILENAME).read_text(encoding="utf-8"))
     assert summary["device"] == "torch_cpu"
+    assert summary["resolved_device"] == "cpu"
+    assert summary["runtime_backend"] == "torch"
+    assert summary["cuda_measurement_available"] is False
     assert summary["quality_ok"] is True
     assert summary["runtime_ok"] is True
     assert summary["memory_ok"] is True

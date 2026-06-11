@@ -138,6 +138,9 @@ def build_final_summary(
         "train_steps": int(harness_report["train_steps"]),
         "runtime_repeats": int(measured_gate_report["measurement_protocol"]["runtime_repeats"]),
         "device": str(measured_gate_report["measurement_protocol"].get("device", harness_report.get("device", "cpu"))),
+        "resolved_device": str(measured_gate_report["measurement_protocol"].get("resolved_device", "cpu")),
+        "runtime_backend": str(measured_gate_report["measurement_protocol"].get("runtime_backend", "unknown")),
+        "cuda_measurement_available": bool(measured_gate_report["measurement_protocol"].get("cuda_measurement_available", False)),
         "teacher_checkpoint_loaded": False,
         "teacher_inference_runtime_required": False,
         "raw_weight_payload_in_graph": False,
@@ -217,6 +220,7 @@ def run_measured_distillation_pipeline(
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
     device: str = "cpu",
+    max_cuda_peak_memory_bytes: int | None = None,
 ) -> dict[str, Any]:
     out = Path(output_root)
     out.mkdir(parents=True, exist_ok=True)
@@ -269,6 +273,7 @@ def run_measured_distillation_pipeline(
         max_peak_memory_bytes=max_peak_memory_bytes,
         min_kl_relative_reduction=min_kl_relative_reduction,
         device=device,
+        max_cuda_peak_memory_bytes=max_cuda_peak_memory_bytes,
     )
     decision_path = out / MEASURED_PROMOTION_DECISION_FILENAME
     promotion_decision = run_and_write_distillation_promotion_decision(gate_path, decision_path)
@@ -328,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-peak-memory-bytes", type=_nonnegative_int, default=128 * 1024 * 1024)
     parser.add_argument("--min-kl-relative-reduction", type=_nonnegative_float, default=0.0)
     parser.add_argument("--device", default="cpu", choices=["cpu", "torch_cpu", "cuda", "auto"])
+    parser.add_argument("--max-cuda-peak-memory-bytes", type=_nonnegative_int, default=None)
     return parser
 
 
@@ -368,6 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_peak_memory_bytes=args.max_peak_memory_bytes,
             min_kl_relative_reduction=args.min_kl_relative_reduction,
             device=args.device,
+            max_cuda_peak_memory_bytes=args.max_cuda_peak_memory_bytes,
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
@@ -380,6 +387,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "promote": summary["promote"],
         "decision": summary["decision"],
         "device": summary["device"],
+        "resolved_device": summary["resolved_device"],
+        "runtime_backend": summary["runtime_backend"],
+        "cuda_measurement_available": summary["cuda_measurement_available"],
         "missing_or_failed_gates": summary["missing_or_failed_gates"],
     }, indent=2, sort_keys=True))
     return 0

@@ -188,6 +188,49 @@ def test_measured_quality_gate_can_fail_threshold_without_promotion(tmp_path):
     assert "quality_ok" in decision["missing_or_failed_gates"]
 
 
+def test_measured_gates_record_device_and_cuda_measurement_contract(tmp_path):
+    harness_out = _build_harness_output(tmp_path)
+    report = build_measured_distillation_gate_report(
+        harness_out,
+        runtime_repeats=1,
+        max_runtime_seconds=10.0,
+        max_peak_memory_bytes=128 * 1024 * 1024,
+        device="torch_cpu",
+    )
+    protocol = report["measurement_protocol"]
+    assert protocol["device"] == "torch_cpu"
+    assert protocol["requested_device"] == "torch_cpu"
+    assert protocol["resolved_device"] == "cpu"
+    assert protocol["runtime_backend"] == "torch"
+    assert protocol["torch_available"] is True
+    assert protocol["cuda_measurement_available"] is False
+    assert protocol["cuda_runtime_protocol"] == "unavailable"
+    assert protocol["cuda_memory_protocol"] == "unavailable"
+    assert report["runtime_gate"]["cuda_duration_seconds"] == []
+    assert report["runtime_gate"]["cuda_duration_median_seconds"] is None
+    assert report["memory_gate"]["host_memory_ok"] is True
+    assert report["memory_gate"]["cuda_memory_ok"] is None
+    assert report["memory_gate"]["cuda_peak_bytes"] == []
+    assert report["memory_gate"]["cuda_peak_max_bytes"] is None
+    assert validate_measured_distillation_gate_report(report)["promote_ready"] is True
+
+
+def test_run_and_write_measured_gates_forwards_device_override(tmp_path):
+    harness_out = _build_harness_output(tmp_path)
+    report_path = harness_out / "torch_cpu_measured_gate_report.json"
+    report = run_and_write_measured_distillation_gate_report(
+        harness_out,
+        report_path,
+        runtime_repeats=1,
+        max_runtime_seconds=10.0,
+        max_peak_memory_bytes=128 * 1024 * 1024,
+        device="torch_cpu",
+    )
+    assert report_path.exists()
+    assert report["measurement_protocol"]["device"] == "torch_cpu"
+    assert report["measurement_protocol"]["runtime_backend"] == "torch"
+
+
 def test_measured_gates_reject_bad_args(tmp_path):
     harness_out = _build_harness_output(tmp_path)
     with pytest.raises(ValueError, match="runtime_repeats"):

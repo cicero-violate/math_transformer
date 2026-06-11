@@ -11,6 +11,7 @@ from typing import Any
 from src.qwen_distillation_harness import load_distillation_harness_report, validate_distillation_harness_report
 from src.qwen_kl_distillation_trainable import run_logit_bias_training_loop
 from src.qwen_logit_distillation_targets import validate_frozen_logit_distillation_targets
+from src.qwen_sparse_student_runtime import resolve_runtime_device
 
 
 SCHEMA_VERSION = "qwen_distillation_gate.v1"
@@ -33,7 +34,8 @@ def _validate_args(
     max_runtime_seconds: float,
     max_peak_memory_bytes: int,
     min_kl_relative_reduction: float,
-) -> tuple[int, float, int, float]:
+    max_cuda_peak_memory_bytes: int | None = None,
+) -> tuple[int, float, int, float, int | None]:
     if runtime_repeats < 1:
         raise ValueError(f"runtime_repeats must be >= 1, got {runtime_repeats}")
     max_seconds = _finite_float(max_runtime_seconds, name="max_runtime_seconds")
@@ -45,7 +47,10 @@ def _validate_args(
     min_reduction = _finite_float(min_kl_relative_reduction, name="min_kl_relative_reduction")
     if min_reduction < 0.0:
         raise ValueError(f"min_kl_relative_reduction must be >= 0, got {min_kl_relative_reduction!r}")
-    return runtime_repeats, max_seconds, max_bytes, min_reduction
+    cuda_max_bytes = None if max_cuda_peak_memory_bytes is None else int(max_cuda_peak_memory_bytes)
+    if cuda_max_bytes is not None and cuda_max_bytes < 0:
+        raise ValueError(f"max_cuda_peak_memory_bytes must be >= 0, got {max_cuda_peak_memory_bytes!r}")
+    return runtime_repeats, max_seconds, max_bytes, min_reduction, cuda_max_bytes
 
 
 def _percentile_nearest_rank(values: list[float], percentile: float) -> float:
@@ -79,9 +84,77 @@ def _collect_checked_artifacts(harness_output_dir: Path, harness_report: dict[st
     return checked
 
 
-def _run_one_measured_training_loop(harness_report: dict[str, Any], *, device: str = "cpu") -> tuple[dict[str, Any], float, int]:
+def _torch_module():
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return None
+    return torch
+
+
+def _start_cuda_measurement(device_info: dict[str, Any]) -> dict[str, Any]:
+    if device_info.get("resolved_device") != "cuda":
+        return {
+            "available": False,
+            "reason": "resolved device is not cuda",
+            "elapsed_seconds": None,
+            "peak_memory_bytes": None,
+        }
+    torch = _torch_module()
+    if torch is None or not torch.cuda.is_available():
+        return {
+            "available": False,
+            "reason": "torch CUDA unavailable",
+            "elapsed_seconds": None,
+            "peak_memory_bytes": None,
+        }
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    return {
+        "available": True,
+        "reason": "cuda event and peak memory measurement available",
+        "torch": torch,
+        "start_event": start_event,
+        "end_event": end_event,
+        "elapsed_seconds": None,
+        "peak_memory_bytes": None,
+    }
+
+
+def _finish_cuda_measurement(state: dict[str, Any]) -> dict[str, Any]:
+    if not bool(state.get("available")):
+        return {
+            "available": False,
+            "reason": state.get("reason", "cuda measurement unavailable"),
+            "elapsed_seconds": None,
+            "peak_memory_bytes": None,
+        }
+    torch = state["torch"]
+    end_event = state["end_event"]
+    start_event = state["start_event"]
+    end_event.record()
+    torch.cuda.synchronize()
+    return {
+        "available": True,
+        "reason": "cuda event and peak memory measurement captured",
+        "elapsed_seconds": float(start_event.elapsed_time(end_event)) / 1000.0,
+        "peak_memory_bytes": int(torch.cuda.max_memory_allocated()),
+    }
+
+
+def _run_one_measured_training_loop(
+    harness_report: dict[str, Any],
+    *,
+    device: str = "cpu",
+    device_info: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], float, int, dict[str, Any]]:
     eval_output_dir = Path(harness_report["eval_output_dir"])
     logit_targets_dir = Path(harness_report["logit_targets_dir"])
+    info = resolve_runtime_device(device) if device_info is None else dict(device_info)
+    cuda_state = _start_cuda_measurement(info)
     tracemalloc.start()
     started = time.perf_counter()
     try:
@@ -101,7 +174,8 @@ def _run_one_measured_training_loop(harness_report: dict[str, Any], *, device: s
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return report, elapsed, int(peak)
+    cuda_measurement = _finish_cuda_measurement(cuda_state)
+    return report, elapsed, int(peak), cuda_measurement
 
 
 def build_measured_distillation_gate_report(
@@ -112,6 +186,7 @@ def build_measured_distillation_gate_report(
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
     device: str | None = None,
+    max_cuda_peak_memory_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Measure task-quality, runtime, and memory gates for a P10 harness output.
 
@@ -119,11 +194,18 @@ def build_measured_distillation_gate_report(
     frozen target rows. Runtime is wall-clock elapsed seconds for the bounded KL
     training loop. Memory is Python tracemalloc peak bytes during that loop.
     """
-    runtime_repeats, max_runtime_seconds, max_peak_memory_bytes, min_kl_relative_reduction = _validate_args(
+    (
+        runtime_repeats,
+        max_runtime_seconds,
+        max_peak_memory_bytes,
+        min_kl_relative_reduction,
+        max_cuda_peak_memory_bytes,
+    ) = _validate_args(
         runtime_repeats=runtime_repeats,
         max_runtime_seconds=max_runtime_seconds,
         max_peak_memory_bytes=max_peak_memory_bytes,
         min_kl_relative_reduction=min_kl_relative_reduction,
+        max_cuda_peak_memory_bytes=max_cuda_peak_memory_bytes,
     )
     base = Path(harness_output_dir)
     harness_report = load_distillation_harness_report(base / "distillation_harness_report.json")
@@ -131,15 +213,27 @@ def build_measured_distillation_gate_report(
     checked_artifacts = _collect_checked_artifacts(base, harness_report)
     target_summary = validate_frozen_logit_distillation_targets(harness_report["logit_targets_dir"])
     measured_device = str(device if device is not None else harness_report.get("device", "cpu"))
+    device_info = resolve_runtime_device(measured_device)
+    cuda_memory_limit = max_peak_memory_bytes if max_cuda_peak_memory_bytes is None else max_cuda_peak_memory_bytes
 
     measured_reports: list[dict[str, Any]] = []
     durations: list[float] = []
     peak_bytes: list[int] = []
+    cuda_durations: list[float] = []
+    cuda_peak_bytes: list[int] = []
+    cuda_measurement_available = device_info["resolved_device"] == "cuda"
     for _idx in range(runtime_repeats):
-        report, elapsed, peak = _run_one_measured_training_loop(harness_report, device=measured_device)
+        report, elapsed, peak, cuda_measurement = _run_one_measured_training_loop(
+            harness_report,
+            device=measured_device,
+            device_info=device_info,
+        )
         measured_reports.append(report)
         durations.append(elapsed)
         peak_bytes.append(peak)
+        if bool(cuda_measurement.get("available")):
+            cuda_durations.append(float(cuda_measurement["elapsed_seconds"]))
+            cuda_peak_bytes.append(int(cuda_measurement["peak_memory_bytes"]))
 
     first = measured_reports[0]
     kl_initial = _finite_float(first["kl_initial"], name="kl_initial")
@@ -166,7 +260,11 @@ def build_measured_distillation_gate_report(
     runtime_ok = duration_median <= max_runtime_seconds and duration_p95 <= max_runtime_seconds
     peak_max = max(peak_bytes)
     peak_median = int(statistics.median(peak_bytes))
-    memory_ok = peak_max <= max_peak_memory_bytes
+    host_memory_ok = peak_max <= max_peak_memory_bytes
+    cuda_peak_max = max(cuda_peak_bytes) if cuda_peak_bytes else None
+    cuda_peak_median = int(statistics.median(cuda_peak_bytes)) if cuda_peak_bytes else None
+    cuda_memory_ok = None if cuda_peak_max is None else cuda_peak_max <= int(cuda_memory_limit)
+    memory_ok = host_memory_ok and (cuda_memory_ok is not False)
     safety_ok = (
         bool(harness_report.get("student_training_started"))
         and not bool(harness_report.get("teacher_checkpoint_loaded", True))
@@ -196,8 +294,16 @@ def build_measured_distillation_gate_report(
             "quality_protocol": "frozen_logit_kl_reduction",
             "runtime_protocol": "perf_counter_bounded_kl_training_loop",
             "memory_protocol": "tracemalloc_peak_bounded_kl_training_loop",
+            "cuda_runtime_protocol": "cuda_event_bounded_kl_training_loop" if cuda_measurement_available else "unavailable",
+            "cuda_memory_protocol": "torch_cuda_max_memory_allocated" if cuda_measurement_available else "unavailable",
             "runtime_repeats": runtime_repeats,
             "device": measured_device,
+            "requested_device": device_info["requested_device"],
+            "resolved_device": device_info["resolved_device"],
+            "runtime_backend": device_info["runtime_backend"],
+            "torch_available": device_info["torch_available"],
+            "cuda_available": device_info["cuda_available"],
+            "cuda_measurement_available": cuda_measurement_available,
             "target_rows_sha256": target_summary["target_rows_sha256"],
         },
         "quality_gate": {
@@ -225,6 +331,11 @@ def build_measured_distillation_gate_report(
             "duration_median_seconds": duration_median,
             "duration_p95_seconds": duration_p95,
             "duration_max_seconds": duration_max,
+            "cuda_available": device_info["cuda_available"],
+            "cuda_measurement_available": cuda_measurement_available,
+            "cuda_duration_seconds": cuda_durations,
+            "cuda_duration_median_seconds": statistics.median(cuda_durations) if cuda_durations else None,
+            "cuda_duration_p95_seconds": _percentile_nearest_rank(cuda_durations, 95.0) if cuda_durations else None,
             "max_runtime_seconds": max_runtime_seconds,
             "reason": "runtime within threshold" if runtime_ok else "runtime threshold failed",
         },
@@ -232,10 +343,18 @@ def build_measured_distillation_gate_report(
             "gate_name": "bounded_kl_training_tracemalloc_peak",
             "available": True,
             "memory_ok": memory_ok,
+            "host_memory_ok": host_memory_ok,
             "peak_bytes": peak_bytes,
             "peak_median_bytes": peak_median,
             "peak_max_bytes": peak_max,
             "max_peak_memory_bytes": max_peak_memory_bytes,
+            "cuda_available": device_info["cuda_available"],
+            "cuda_measurement_available": cuda_measurement_available,
+            "cuda_memory_ok": cuda_memory_ok,
+            "cuda_peak_bytes": cuda_peak_bytes,
+            "cuda_peak_median_bytes": cuda_peak_median,
+            "cuda_peak_max_bytes": cuda_peak_max,
+            "max_cuda_peak_memory_bytes": int(cuda_memory_limit),
             "reason": "memory within threshold" if memory_ok else "memory threshold failed",
         },
         "safety_gate": {
@@ -338,6 +457,7 @@ def run_and_write_measured_distillation_gate_report(
     max_peak_memory_bytes: int = 128 * 1024 * 1024,
     min_kl_relative_reduction: float = 0.0,
     device: str | None = None,
+    max_cuda_peak_memory_bytes: int | None = None,
 ) -> dict[str, Any]:
     report = build_measured_distillation_gate_report(
         harness_output_dir,
@@ -345,6 +465,8 @@ def run_and_write_measured_distillation_gate_report(
         max_runtime_seconds=max_runtime_seconds,
         max_peak_memory_bytes=max_peak_memory_bytes,
         min_kl_relative_reduction=min_kl_relative_reduction,
+        device=device,
+        max_cuda_peak_memory_bytes=max_cuda_peak_memory_bytes,
     )
     validate_measured_distillation_gate_report(report)
     path = Path(output_path) if output_path is not None else Path(harness_output_dir) / DEFAULT_MEASURED_GATE_REPORT_FILENAME
