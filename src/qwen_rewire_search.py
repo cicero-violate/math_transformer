@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from src.qwen_rewire_acceptance import run_and_write_rewire_acceptance_report, validate_rewire_acceptance_report
-from src.qwen_rewire_proposal import run_and_write_rewire_proposal_report, validate_rewire_proposal_report
+from src.qwen_rewire_proposal import PROPOSAL_POLICIES, run_and_write_rewire_proposal_report, validate_rewire_proposal_report
 
 
 SCHEMA_VERSION = "qwen_rewire_search.v1"
@@ -55,6 +55,8 @@ def _candidate_row(
     *,
     candidate_index: int,
     max_swaps: int,
+    proposal_policy: str,
+    policy_seed: int,
     proposal_dir: Path,
     acceptance_dir: Path,
     proposal_report: dict[str, Any],
@@ -65,6 +67,8 @@ def _candidate_row(
     return {
         "candidate_index": candidate_index,
         "max_swaps": max_swaps,
+        "proposal_policy": proposal_policy,
+        "policy_seed": policy_seed,
         "proposal_dir": str(proposal_dir),
         "acceptance_dir": str(acceptance_dir),
         "proposal_bounded": bool(proposal_report["proposal_bounded"]),
@@ -91,6 +95,7 @@ def _best_candidate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         key=lambda row: (
             float(row["candidate_minus_base_kl_final"]),
             int(row["proposal_swap_count"]),
+            str(row.get("proposal_policy", "")),
             int(row["candidate_index"]),
         ),
     )
@@ -111,6 +116,8 @@ def build_rewire_search_report(
     k: int | None = None,
     adjacency_name: str | None = None,
     max_swaps_values: Sequence[int] | None = None,
+    proposal_policies: Sequence[str] | None = None,
+    policy_seed: int = 0,
     logit_targets_dir: str | Path | None = None,
     vocab_size: int = 16,
     target_seeds: list[int] | None = None,
@@ -128,6 +135,12 @@ def build_rewire_search_report(
         [1, 2, 3] if max_swaps_values is None else max_swaps_values,
         name="max_swaps_values",
     )
+    policies = list(["same_source_top_weight"] if proposal_policies is None else proposal_policies)
+    if not policies:
+        raise ValueError("proposal_policies must contain at least one policy")
+    bad_policies = [policy for policy in policies if policy not in PROPOSAL_POLICIES]
+    if bad_policies:
+        raise ValueError(f"proposal_policy must be one of {sorted(PROPOSAL_POLICIES)}, got {bad_policies[0]!r}")
     if selection_policy != "first_accepted_else_best_kl_delta":
         raise ValueError(f"unsupported selection_policy={selection_policy!r}")
     max_kl_regression = _finite_float(max_kl_regression, name="max_kl_regression")
@@ -137,19 +150,26 @@ def build_rewire_search_report(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     candidate_rows: list[dict[str, Any]] = []
-    for idx, max_swaps in enumerate(swaps_values):
-        candidate_root = out / "candidates" / f"candidate_{idx:03d}_swaps_{max_swaps}"
-        proposal_dir = candidate_root / "proposal"
-        acceptance_dir = candidate_root / "acceptance"
-        proposal_report = run_and_write_rewire_proposal_report(
+    candidate_index = 0
+    for proposal_policy in policies:
+        for max_swaps in swaps_values:
+            idx = candidate_index
+            candidate_index += 1
+            safe_policy = proposal_policy.replace("/", "_")
+            candidate_root = out / "candidates" / f"candidate_{idx:03d}_{safe_policy}_swaps_{max_swaps}"
+            proposal_dir = candidate_root / "proposal"
+            acceptance_dir = candidate_root / "acceptance"
+            proposal_report = run_and_write_rewire_proposal_report(
             eval_output_dir,
             edge_trace_dir,
             proposal_dir,
             k=k,
             adjacency_name=adjacency_name,
-            max_swaps=max_swaps,
-        )
-        acceptance_report = run_and_write_rewire_acceptance_report(
+                max_swaps=max_swaps,
+                proposal_policy=proposal_policy,
+                policy_seed=policy_seed,
+            )
+            acceptance_report = run_and_write_rewire_acceptance_report(
             eval_output_dir=eval_output_dir,
             rewire_proposal_dir=proposal_dir,
             output_dir=acceptance_dir,
@@ -164,12 +184,14 @@ def build_rewire_search_report(
             projection_seed=projection_seed,
             temperature=temperature,
             device=device,
-            max_kl_regression=max_kl_regression,
-        )
-        candidate_rows.append(
+                max_kl_regression=max_kl_regression,
+            )
+            candidate_rows.append(
             _candidate_row(
                 candidate_index=idx,
                 max_swaps=max_swaps,
+                proposal_policy=proposal_policy,
+                policy_seed=policy_seed,
                 proposal_dir=proposal_dir,
                 acceptance_dir=acceptance_dir,
                 proposal_report=proposal_report,
@@ -201,6 +223,8 @@ def build_rewire_search_report(
         "k": k,
         "adjacency_name": adjacency_name,
         "max_swaps_values": swaps_values,
+        "proposal_policies": policies,
+        "policy_seed": int(policy_seed),
         "candidate_count": len(candidate_rows),
         "accepted_candidate_count": accepted_candidate_count,
         "any_accepted": any_accepted,
@@ -303,6 +327,8 @@ def run_and_write_rewire_search_report(
     k: int | None = None,
     adjacency_name: str | None = None,
     max_swaps_values: Sequence[int] | None = None,
+    proposal_policies: Sequence[str] | None = None,
+    policy_seed: int = 0,
     logit_targets_dir: str | Path | None = None,
     vocab_size: int = 16,
     target_seeds: list[int] | None = None,
@@ -322,6 +348,8 @@ def run_and_write_rewire_search_report(
         k=k,
         adjacency_name=adjacency_name,
         max_swaps_values=max_swaps_values,
+        proposal_policies=proposal_policies,
+        policy_seed=policy_seed,
         logit_targets_dir=logit_targets_dir,
         vocab_size=vocab_size,
         target_seeds=target_seeds,
@@ -376,6 +404,16 @@ def _parse_seed_list(raw: str) -> list[int]:
     return values
 
 
+def _parse_policy_list(raw: str) -> list[str]:
+    values = [part.strip() for part in raw.split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("proposal-policies must contain at least one policy")
+    invalid = [policy for policy in values if policy not in PROPOSAL_POLICIES]
+    if invalid:
+        raise argparse.ArgumentTypeError(f"unknown proposal policy={invalid[0]!r}; expected one of {sorted(PROPOSAL_POLICIES)}")
+    return values
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run v26 P3 bounded rewiring proposal search.")
     parser.add_argument("--eval-output-dir", required=True)
@@ -385,6 +423,8 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--k", type=_positive_int, default=None)
     group.add_argument("--adjacency-name", default=None)
     parser.add_argument("--max-swaps-values", type=lambda raw: _parse_int_list(raw, name="max-swaps-values"), default=[1, 2, 3])
+    parser.add_argument("--proposal-policies", type=_parse_policy_list, default=["same_source_top_weight"])
+    parser.add_argument("--policy-seed", type=int, default=0)
     parser.add_argument("--logit-targets-dir", default=None)
     parser.add_argument("--vocab-size", type=_positive_int, default=16)
     parser.add_argument("--target-seeds", type=_parse_seed_list, default=[0, 1, 2])
@@ -410,6 +450,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             k=args.k,
             adjacency_name=args.adjacency_name,
             max_swaps_values=args.max_swaps_values,
+            proposal_policies=args.proposal_policies,
+            policy_seed=args.policy_seed,
             logit_targets_dir=args.logit_targets_dir,
             vocab_size=args.vocab_size,
             target_seeds=args.target_seeds,

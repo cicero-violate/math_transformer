@@ -123,6 +123,52 @@ def test_rewire_proposal_builds_bounded_same_source_swaps(tmp_path):
         assert swap["drop_utility_score"] >= 0.0
 
 
+def test_rewire_proposal_supports_multiple_policies(tmp_path):
+    eval_out, trace_out = _build_eval_and_trace(tmp_path)
+    top_weight = build_rewire_proposal_report(
+        eval_out,
+        trace_out,
+        k=1,
+        max_swaps=2,
+        proposal_policy="same_source_top_weight",
+    )
+    low_weight = build_rewire_proposal_report(
+        eval_out,
+        trace_out,
+        k=1,
+        max_swaps=2,
+        proposal_policy="same_source_low_weight",
+    )
+    same_relation = build_rewire_proposal_report(
+        eval_out,
+        trace_out,
+        k=1,
+        max_swaps=2,
+        proposal_policy="same_relation_top_weight",
+    )
+    random_policy = build_rewire_proposal_report(
+        eval_out,
+        trace_out,
+        k=1,
+        max_swaps=2,
+        proposal_policy="deterministic_random",
+        policy_seed=7,
+    )
+    for report in [top_weight, low_weight, same_relation, random_policy]:
+        assert report["proposal_bounded"] is True
+        assert report["topology_mutated"] is False
+        assert report["accepted"] is False
+        assert report["swap_count"] <= 2
+        assert validate_rewire_proposal_report(report)["proposal_bounded"] is True
+    assert top_weight["proposal_policy"] == "same_source_top_weight"
+    assert low_weight["proposal_policy"] == "same_source_low_weight"
+    assert same_relation["proposal_policy"] == "same_relation_top_weight"
+    assert random_policy["policy_seed"] == 7
+    for swap in same_relation["swaps"]:
+        assert swap["drop_relation"] == swap["add_relation"]
+    assert top_weight["swaps"] != low_weight["swaps"] or top_weight["swaps"] != random_policy["swaps"]
+
+
 def test_rewire_proposal_writes_report_and_proposed_adjacency(tmp_path):
     eval_out, trace_out = _build_eval_and_trace(tmp_path)
     out = tmp_path / "proposal"

@@ -134,6 +134,39 @@ def test_rewire_search_evaluates_multiple_candidates_without_applying_topology(t
     assert base_after["adjacency_name"] == "qwen_topk_k1"
 
 
+def test_rewire_search_sweeps_multiple_policies(tmp_path):
+    eval_out, trace_out = _build_eval_and_trace(tmp_path)
+    out = tmp_path / "search_policies"
+    report = build_rewire_search_report(
+        eval_output_dir=eval_out,
+        edge_trace_dir=trace_out,
+        output_dir=out,
+        k=1,
+        max_swaps_values=[1, 2],
+        proposal_policies=["same_source_top_weight", "same_source_low_weight", "deterministic_random"],
+        policy_seed=11,
+        target_seeds=[0, 1, 2],
+        train_steps=5,
+        lr=0.1,
+        device="torch_cpu",
+    )
+    assert report["candidate_count"] == 6
+    assert report["proposal_policies"] == ["same_source_top_weight", "same_source_low_weight", "deterministic_random"]
+    assert report["policy_seed"] == 11
+    seen = {(row["proposal_policy"], row["max_swaps"]) for row in report["candidates"]}
+    assert seen == {
+        ("same_source_top_weight", 1),
+        ("same_source_top_weight", 2),
+        ("same_source_low_weight", 1),
+        ("same_source_low_weight", 2),
+        ("deterministic_random", 1),
+        ("deterministic_random", 2),
+    }
+    assert report["proposal_applied"] is False
+    assert report["topology_mutated"] is False
+    assert validate_rewire_search_report(report)["candidate_count"] == 6
+
+
 def test_rewire_search_writes_report(tmp_path):
     eval_out, trace_out = _build_eval_and_trace(tmp_path)
     out = tmp_path / "search_write"

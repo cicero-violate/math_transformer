@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -16,6 +17,13 @@ SCHEMA_VERSION = "qwen_rewire_proposal.v1"
 PROPOSED_ADJACENCY_SCHEMA_VERSION = "qwen_rewire_proposed_adjacency.v1"
 REWIRE_PROPOSAL_FILENAME = "rewire_proposal.json"
 PROPOSED_ADJACENCY_FILENAME = "proposed_adjacency.json"
+PROPOSAL_POLICIES = {
+    "same_source_top_weight",
+    "same_relation_top_weight",
+    "utility_ratio",
+    "same_source_low_weight",
+    "deterministic_random",
+}
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -79,13 +87,56 @@ def _candidate_edges_from_g_pool(eval_output_dir: Path) -> list[dict[str, Any]]:
     return [edge.as_dict() for edge in candidates.edges]
 
 
+def _stable_unit_interval(*parts: object) -> float:
+    raw = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    return int(digest, 16) / float(16**16 - 1)
+
+
+def _candidate_sort_key(edge: dict[str, Any], *, proposal_policy: str, policy_seed: int) -> tuple[float, str, str, str]:
+    weight = float(edge["weight"])
+    if proposal_policy == "same_source_low_weight":
+        primary = weight
+    elif proposal_policy == "deterministic_random":
+        primary = _stable_unit_interval(policy_seed, edge["edge_id"])
+    else:
+        primary = -weight
+    return (primary, str(edge.get("relation", "")), str(edge["dst_id"]), str(edge["edge_id"]))
+
+
+def _drop_sort_key(edge: dict[str, Any], utility_by_edge: dict[str, dict[str, Any]], *, proposal_policy: str) -> tuple[float, float, str, str, str, str]:
+    utility = float(utility_by_edge.get(_edge_id(edge), {}).get("utility_score", 0.0))
+    weight = abs(float(edge.get("weight", 0.0)))
+    primary = utility / (weight + 1.0e-12) if proposal_policy == "utility_ratio" else utility
+    return (
+        primary,
+        utility,
+        str(edge.get("relation", "")),
+        str(edge["src_id"]),
+        str(edge["dst_id"]),
+        str(edge["edge_id"]),
+    )
+
+
+def _candidate_allowed(drop: dict[str, Any], candidate: dict[str, Any], *, proposal_policy: str) -> bool:
+    if str(drop["src_id"]) != str(candidate["src_id"]):
+        return False
+    if proposal_policy == "same_relation_top_weight" and str(drop.get("relation", "")) != str(candidate.get("relation", "")):
+        return False
+    return True
+
+
 def _select_swaps(
     *,
     active_edges: list[dict[str, Any]],
     candidate_edges: list[dict[str, Any]],
     utility_by_edge: dict[str, dict[str, Any]],
     max_swaps: int,
+    proposal_policy: str = "same_source_top_weight",
+    policy_seed: int = 0,
 ) -> list[dict[str, Any]]:
+    if proposal_policy not in PROPOSAL_POLICIES:
+        raise ValueError(f"proposal_policy must be one of {sorted(PROPOSAL_POLICIES)}, got {proposal_policy!r}")
     active_ids = {_edge_id(edge) for edge in active_edges}
     active_keys = {_edge_key(edge) for edge in active_edges}
     inactive_by_src: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -94,17 +145,11 @@ def _select_swaps(
             continue
         inactive_by_src[str(candidate["src_id"])].append(dict(candidate))
     for src_id in inactive_by_src:
-        inactive_by_src[src_id].sort(key=lambda edge: (-float(edge["weight"]), str(edge.get("relation", "")), str(edge["dst_id"]), str(edge["edge_id"])))
+        inactive_by_src[src_id].sort(key=lambda edge: _candidate_sort_key(edge, proposal_policy=proposal_policy, policy_seed=policy_seed))
 
     active_sorted = sorted(
         active_edges,
-        key=lambda edge: (
-            float(utility_by_edge.get(_edge_id(edge), {}).get("utility_score", 0.0)),
-            str(edge.get("relation", "")),
-            str(edge["src_id"]),
-            str(edge["dst_id"]),
-            str(edge["edge_id"]),
-        ),
+        key=lambda edge: _drop_sort_key(edge, utility_by_edge, proposal_policy=proposal_policy),
     )
     swaps: list[dict[str, Any]] = []
     used_add_ids: set[str] = set()
@@ -113,11 +158,15 @@ def _select_swaps(
             break
         src_id = str(drop["src_id"])
         replacement = None
-        while inactive_by_src.get(src_id):
-            candidate = inactive_by_src[src_id].pop(0)
-            if _edge_id(candidate) not in used_add_ids:
+        candidates = inactive_by_src.get(src_id, [])
+        remove_idx = None
+        for idx, candidate in enumerate(candidates):
+            if _edge_id(candidate) not in used_add_ids and _candidate_allowed(drop, candidate, proposal_policy=proposal_policy):
                 replacement = candidate
+                remove_idx = idx
                 break
+        if remove_idx is not None:
+            candidates.pop(remove_idx)
         if replacement is None:
             continue
         used_add_ids.add(_edge_id(replacement))
@@ -135,7 +184,9 @@ def _select_swaps(
                 "drop_weight": float(drop["weight"]),
                 "add_weight": float(replacement["weight"]),
                 "drop_utility_score": float(utility.get("utility_score", 0.0)),
-                "reason": "replace_low_utility_active_edge_with_same_source_inactive_graph_prior_candidate",
+                "proposal_policy": proposal_policy,
+                "policy_seed": policy_seed,
+                "reason": f"{proposal_policy}: replace low-utility active edge with same-source inactive graph-prior candidate",
                 "drop_edge": dict(drop),
                 "add_edge": dict(replacement),
             }
@@ -188,9 +239,13 @@ def build_rewire_proposal_report(
     k: int | None = None,
     adjacency_name: str | None = None,
     max_swaps: int = 1,
+    proposal_policy: str = "same_source_top_weight",
+    policy_seed: int = 0,
 ) -> dict[str, Any]:
     if max_swaps < 1:
         raise ValueError(f"max_swaps must be >= 1, got {max_swaps}")
+    if proposal_policy not in PROPOSAL_POLICIES:
+        raise ValueError(f"proposal_policy must be one of {sorted(PROPOSAL_POLICIES)}, got {proposal_policy!r}")
     eval_dir = Path(eval_output_dir)
     trace_dir = Path(edge_trace_dir)
     edge_trace_report = load_edge_trace_report(trace_dir)
@@ -209,6 +264,8 @@ def build_rewire_proposal_report(
         candidate_edges=candidate_edges,
         utility_by_edge=utility_by_edge,
         max_swaps=max_swaps,
+        proposal_policy=proposal_policy,
+        policy_seed=policy_seed,
     )
     proposed_edges = _proposed_edges(active_edges, swaps)
     proposed_payload = _build_proposed_adjacency_payload(
@@ -240,6 +297,8 @@ def build_rewire_proposal_report(
         "candidate_edge_count": len(candidate_edges),
         "inactive_candidate_count": len([edge for edge in candidate_edges if _edge_id(edge) not in {_edge_id(active) for active in active_edges}]),
         "max_swaps": max_swaps,
+        "proposal_policy": proposal_policy,
+        "policy_seed": int(policy_seed),
         "swap_count": len(swaps),
         "proposal_bounded": bounded,
         "proposed_edge_count": proposed_payload["edge_count"],
@@ -294,6 +353,9 @@ def validate_rewire_proposal_report(report: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("swap_count must match len(swaps)")
     if len(swaps) > int(report.get("max_swaps", -1)):
         raise ValueError("swap_count must not exceed max_swaps")
+    proposal_policy = str(report.get("proposal_policy", "same_source_top_weight"))
+    if proposal_policy not in PROPOSAL_POLICIES:
+        raise ValueError("proposal_policy is not supported")
     seen_drop: set[str] = set()
     seen_add: set[str] = set()
     for swap in swaps:
@@ -307,6 +369,8 @@ def validate_rewire_proposal_report(report: dict[str, Any]) -> dict[str, Any]:
         seen_add.add(add_id)
         if str(swap.get("src_id")) != str(swap.get("add_edge", {}).get("src_id")):
             raise ValueError("swap replacement must preserve source id")
+        if proposal_policy == "same_relation_top_weight" and str(swap.get("drop_relation")) != str(swap.get("add_relation")):
+            raise ValueError("same_relation_top_weight swaps must preserve relation")
         if float(swap.get("drop_utility_score", -1.0)) < 0.0:
             raise ValueError("drop utility score must be non-negative")
     proposed = report.get("proposed_adjacency")
@@ -354,6 +418,8 @@ def run_and_write_rewire_proposal_report(
     k: int | None = None,
     adjacency_name: str | None = None,
     max_swaps: int = 1,
+    proposal_policy: str = "same_source_top_weight",
+    policy_seed: int = 0,
 ) -> dict[str, Any]:
     report = build_rewire_proposal_report(
         eval_output_dir,
@@ -362,6 +428,8 @@ def run_and_write_rewire_proposal_report(
         k=k,
         adjacency_name=adjacency_name,
         max_swaps=max_swaps,
+        proposal_policy=proposal_policy,
+        policy_seed=policy_seed,
     )
     write_rewire_proposal_report(report, output_dir)
     return _serializable_report(report)
@@ -383,6 +451,8 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--k", type=_positive_int, default=None)
     group.add_argument("--adjacency-name", default=None)
     parser.add_argument("--max-swaps", type=_positive_int, default=1)
+    parser.add_argument("--proposal-policy", default="same_source_top_weight", choices=sorted(PROPOSAL_POLICIES))
+    parser.add_argument("--policy-seed", type=int, default=0)
     return parser
 
 
@@ -397,6 +467,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             k=args.k,
             adjacency_name=args.adjacency_name,
             max_swaps=args.max_swaps,
+            proposal_policy=args.proposal_policy,
+            policy_seed=args.policy_seed,
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
@@ -409,6 +481,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "proposed_edge_count": report["proposed_edge_count"],
         "proposed_max_out_degree": report["proposed_max_out_degree"],
         "swap_count": report["swap_count"],
+        "proposal_policy": report["proposal_policy"],
+        "policy_seed": report["policy_seed"],
         "proposal_bounded": report["proposal_bounded"],
         "topology_mutated": report["topology_mutated"],
         "accepted": report["accepted"],
