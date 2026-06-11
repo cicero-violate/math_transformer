@@ -19,9 +19,26 @@ from .qwen_weight_graph import (
 
 
 SCHEMA_VERSION = "qwen_graph_prior_eval.v1"
+SELECTED_ADJACENCY_SCHEMA_VERSION = "qwen_selected_adjacency.v1"
+SELECTED_ADJACENCY_INDEX_SCHEMA_VERSION = "qwen_selected_adjacency_index.v1"
+V25_HANDOFF_SCHEMA_VERSION = "qwen_v25_handoff.v1"
 DEFAULT_K_VALUES = [4, 8, 16]
 DEFAULT_BASELINES = ["dense_full", "hand_k4", "learned_k4", "random_matched"]
 UNAVAILABLE_METRIC = None
+QUALITY_MODE_AUTO = "auto"
+QUALITY_MODE_UNAVAILABLE = "unavailable"
+QUALITY_MODE_IMPLANTED_RECOVERY = "implanted_recovery"
+QUALITY_MODE_ENERGY_CAPTURE = "energy_capture"
+QUALITY_MODE_ALIASES = {
+    "": QUALITY_MODE_AUTO,
+    QUALITY_MODE_AUTO: QUALITY_MODE_AUTO,
+    "none": QUALITY_MODE_UNAVAILABLE,
+    QUALITY_MODE_UNAVAILABLE: QUALITY_MODE_UNAVAILABLE,
+    QUALITY_MODE_IMPLANTED_RECOVERY: QUALITY_MODE_IMPLANTED_RECOVERY,
+    "implanted_signal_recovery": QUALITY_MODE_IMPLANTED_RECOVERY,
+    QUALITY_MODE_ENERGY_CAPTURE: QUALITY_MODE_ENERGY_CAPTURE,
+    "energy_capture_proxy": QUALITY_MODE_ENERGY_CAPTURE,
+}
 
 
 @dataclass(frozen=True)
@@ -166,6 +183,31 @@ def build_qwen_topk_adjacency(
         name=f"qwen_topk_k{k}",
         source="G_0",
         k=k,
+        edges=prior_edges,
+        node_count=len(node_ids),
+    )
+
+
+def build_candidate_adjacency(
+    result: WeightGraphResult,
+    *,
+    graph_scope: str = "attention_mlp_moe",
+    edge_score_name: str = "normalized_frobenius",
+) -> PriorAdjacency:
+    """Return all graph-prior candidate edges used as the energy proxy denominator."""
+    kinds = _node_kind_by_id(result)
+    features = _node_features_by_id(result)
+    selected = [
+        edge
+        for edge in result.edges
+        if _edge_allowed(edge, kinds=kinds, features=features, graph_scope=graph_scope, edge_score_name=edge_score_name)
+    ]
+    prior_edges = tuple(_to_prior_edge(edge, source="G_0_candidate") for edge in selected)
+    node_ids = {edge.src_id for edge in prior_edges} | {edge.dst_id for edge in prior_edges}
+    return PriorAdjacency(
+        name="candidate_edges",
+        source="G_0",
+        k=None,
         edges=prior_edges,
         node_count=len(node_ids),
     )
@@ -355,6 +397,78 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
+def write_selected_adjacency_artifacts(
+    *,
+    output_dir: str | Path,
+    source_weight_graph_dir: str | Path,
+    qwen_adjacencies: list[PriorAdjacency],
+    graph_scope: str,
+    edge_score_name: str,
+    quality_mode: str,
+    has_graph_prior_quality_report: bool,
+    selection_policy: str = "per_source_topk_score_desc",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Write bounded qwen adjacency artifacts for the future sparse-student handoff."""
+    out_dir = Path(output_dir)
+    selected_dir = out_dir / "selected_adjacencies"
+    selected_dir.mkdir(parents=True, exist_ok=True)
+
+    index_rows: list[dict[str, Any]] = []
+    for adjacency in qwen_adjacencies:
+        rel_path = Path("selected_adjacencies") / f"{adjacency.name}.json"
+        payload = {
+            "schema_version": SELECTED_ADJACENCY_SCHEMA_VERSION,
+            "adjacency_name": adjacency.name,
+            "source": adjacency.source,
+            "k": adjacency.k,
+            "edge_count": adjacency.edge_count,
+            "node_count": adjacency.node_count,
+            "bounded": True,
+            "selection_policy": selection_policy,
+            "edge_score_name": edge_score_name,
+            "graph_scope": graph_scope,
+            "edges": [edge.as_dict() for edge in adjacency.edges],
+        }
+        _write_json(out_dir / rel_path, payload)
+        index_rows.append(
+            {
+                "adjacency_name": adjacency.name,
+                "k": adjacency.k,
+                "path": str(rel_path),
+                "edge_count": adjacency.edge_count,
+                "node_count": adjacency.node_count,
+            }
+        )
+
+    index = {
+        "schema_version": SELECTED_ADJACENCY_INDEX_SCHEMA_VERSION,
+        "source_weight_graph_dir": str(source_weight_graph_dir),
+        "graph_scope": graph_scope,
+        "edge_score_name": edge_score_name,
+        "selection_policy": selection_policy,
+        "bounded": True,
+        "adjacencies": index_rows,
+    }
+    _write_json(selected_dir / "index.json", index)
+
+    handoff = {
+        "schema_version": V25_HANDOFF_SCHEMA_VERSION,
+        "status": "ready_for_fixed_topology_sparse_student",
+        "source_weight_graph_dir": str(source_weight_graph_dir),
+        "selected_adjacency_index": "selected_adjacencies/index.json",
+        "teacher_checkpoint_loaded": False,
+        "raw_weight_payload_in_graph": False,
+        "bounded_active_adjacency": True,
+        "promotion_required_before_deploy": True,
+        "student_training_started": False,
+        "quality_mode": quality_mode,
+        "graph_prior_quality_report": "graph_prior_quality_report.json" if has_graph_prior_quality_report else None,
+        "promotion_decision": "promotion_decision.json",
+    }
+    _write_json(out_dir / "v25_handoff_manifest.json", handoff)
+    return index, handoff
+
+
 def _load_gold_specs(path: str | Path) -> list[dict[str, Any]]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict):
@@ -362,6 +476,18 @@ def _load_gold_specs(path: str | Path) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         raise ValueError("gold spec file must be a JSON list or object with gold_edges")
     return [dict(item) for item in raw]
+
+
+def _resolve_quality_mode(raw_quality_mode: str | None, *, has_gold_specs: bool) -> str:
+    normalized = QUALITY_MODE_ALIASES.get(str(raw_quality_mode or QUALITY_MODE_AUTO).strip())
+    if normalized is None:
+        allowed = sorted({v for v in QUALITY_MODE_ALIASES.values()})
+        raise ValueError(f"unknown quality_mode={raw_quality_mode!r}; expected one of {allowed}")
+    if normalized == QUALITY_MODE_AUTO:
+        return QUALITY_MODE_IMPLANTED_RECOVERY if has_gold_specs else QUALITY_MODE_UNAVAILABLE
+    if normalized == QUALITY_MODE_IMPLANTED_RECOVERY and not has_gold_specs:
+        raise ValueError("quality_mode='implanted_recovery' requires gold_block_specs")
+    return normalized
 
 
 def _quality_fields_from_report(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -391,6 +517,45 @@ def _quality_fields_from_report(report: dict[str, Any]) -> dict[str, dict[str, A
             "graph_prior_random_recall_std": None,
             "graph_prior_quality_ok": False,
             "graph_prior_metric": "implanted_signal_recovery",
+        }
+    return out
+
+
+def _energy_quality_fields_from_report(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {
+        str(report["adjacency_name"]): {
+            "graph_prior_metric": "energy_capture_proxy",
+            "graph_prior_energy_capture": report["qwen_energy_capture"],
+            "graph_prior_energy_capture_ratio": report["qwen_energy_capture_ratio"],
+            "graph_prior_hit_count": report["qwen_hit_count"],
+            "graph_prior_pred_count": report["qwen_pred_count"],
+            "graph_prior_candidate_edge_count": report["candidate_edge_count"],
+            "graph_prior_candidate_energy_total": report["candidate_energy_total"],
+            "graph_prior_delta_energy_capture": report["delta_energy_capture"],
+            "graph_prior_delta_energy_capture_ratio": report["delta_energy_capture_ratio"],
+            "graph_prior_random_energy_capture_mean": report["random_energy_capture_mean"],
+            "graph_prior_random_energy_capture_std": report["random_energy_capture_std"],
+            "graph_prior_random_energy_capture_ratio_mean": report["random_energy_capture_ratio_mean"],
+            "graph_prior_random_energy_capture_ratio_std": report["random_energy_capture_ratio_std"],
+            "graph_prior_quality_ok": bool(report["quality_ok"]),
+        }
+    }
+    for row in report.get("random_rows", []) or []:
+        out[str(row["adjacency_name"])] = {
+            "graph_prior_metric": "energy_capture_proxy",
+            "graph_prior_energy_capture": row["energy_capture"],
+            "graph_prior_energy_capture_ratio": row["energy_capture_ratio"],
+            "graph_prior_hit_count": row["hit_count"],
+            "graph_prior_pred_count": row["pred_count"],
+            "graph_prior_candidate_edge_count": report["candidate_edge_count"],
+            "graph_prior_candidate_energy_total": report["candidate_energy_total"],
+            "graph_prior_delta_energy_capture": None,
+            "graph_prior_delta_energy_capture_ratio": None,
+            "graph_prior_random_energy_capture_mean": None,
+            "graph_prior_random_energy_capture_std": None,
+            "graph_prior_random_energy_capture_ratio_mean": None,
+            "graph_prior_random_energy_capture_ratio_std": None,
+            "graph_prior_quality_ok": False,
         }
     return out
 
@@ -448,6 +613,69 @@ def _build_graph_prior_quality_report(
     return aggregate, fields_by_name
 
 
+def _build_energy_capture_quality_report(
+    *,
+    result: WeightGraphResult,
+    qwen_adjacencies: list[PriorAdjacency],
+    random_adjacencies: list[PriorAdjacency],
+    graph_scope: str,
+    edge_score_name: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    from .qwen_graph_prior_quality import (
+        SCHEMA_VERSION as QUALITY_SCHEMA_VERSION,
+        evaluate_prior_energy_capture,
+    )
+
+    candidates = build_candidate_adjacency(
+        result,
+        graph_scope=graph_scope,
+        edge_score_name=edge_score_name,
+    )
+    reports = []
+    fields_by_name: dict[str, dict[str, Any]] = {}
+    for qwen_adj in qwen_adjacencies:
+        matched_random = [adj for adj in random_adjacencies if adj.k == qwen_adj.k]
+        report = evaluate_prior_energy_capture(
+            qwen_adjacency=qwen_adj,
+            random_adjacencies=matched_random,
+            candidate_edges=candidates.edges,
+        )
+        reports.append(report)
+        fields_by_name.update(_energy_quality_fields_from_report(report))
+
+    primary = reports[0] if reports else {
+        "qwen_energy_capture": 0.0,
+        "qwen_energy_capture_ratio": 0.0,
+        "random_energy_capture_mean": 0.0,
+        "random_energy_capture_std": 0.0,
+        "random_energy_capture_ratio_mean": 0.0,
+        "random_energy_capture_ratio_std": 0.0,
+        "delta_energy_capture": 0.0,
+        "delta_energy_capture_ratio": 0.0,
+        "candidate_edge_count": candidates.edge_count,
+        "candidate_energy_total": 0.0,
+        "quality_ok": False,
+    }
+    aggregate = {
+        "schema_version": QUALITY_SCHEMA_VERSION,
+        "status": "energy_capture_proxy",
+        "primary_adjacency_name": primary.get("adjacency_name"),
+        "quality_ok": bool(primary["quality_ok"]),
+        "qwen_energy_capture": primary["qwen_energy_capture"],
+        "qwen_energy_capture_ratio": primary["qwen_energy_capture_ratio"],
+        "random_energy_capture_mean": primary["random_energy_capture_mean"],
+        "random_energy_capture_std": primary["random_energy_capture_std"],
+        "random_energy_capture_ratio_mean": primary["random_energy_capture_ratio_mean"],
+        "random_energy_capture_ratio_std": primary["random_energy_capture_ratio_std"],
+        "delta_energy_capture": primary["delta_energy_capture"],
+        "delta_energy_capture_ratio": primary["delta_energy_capture_ratio"],
+        "candidate_edge_count": primary["candidate_edge_count"],
+        "candidate_energy_total": primary["candidate_energy_total"],
+        "rows": reports,
+    }
+    return aggregate, fields_by_name
+
+
 def run_graph_prior_eval(
     *,
     source_weight_graph_dir: str | Path,
@@ -459,6 +687,7 @@ def run_graph_prior_eval(
     quality_dataset: str = "",
     runtime_protocol: str = "unavailable",
     memory_protocol: str = "unavailable",
+    quality_mode: str | None = QUALITY_MODE_AUTO,
     gold_block_specs: list[dict[str, Any]] | None = None,
     min_qwen_recall: float = 0.95,
 ) -> dict[str, Any]:
@@ -470,6 +699,7 @@ def run_graph_prior_eval(
     result = read_weight_graph_artifacts(source_dir)
     world = load_weight_graph_as_world_graph(source_dir)
     manifest_dict = result.manifest.as_dict()
+    resolved_quality_mode = _resolve_quality_mode(quality_mode, has_gold_specs=gold_block_specs is not None)
 
     qwen_adjacencies = [
         build_qwen_topk_adjacency(
@@ -488,7 +718,7 @@ def run_graph_prior_eval(
 
     graph_prior_quality_report: dict[str, Any] | None = None
     quality_fields_by_name: dict[str, dict[str, Any]] = {}
-    if gold_block_specs is not None:
+    if resolved_quality_mode == QUALITY_MODE_IMPLANTED_RECOVERY:
         graph_prior_quality_report, quality_fields_by_name = _build_graph_prior_quality_report(
             result=result,
             qwen_adjacencies=qwen_adjacencies,
@@ -497,11 +727,28 @@ def run_graph_prior_eval(
             edge_score_name=edge_score_name,
             min_qwen_recall=min_qwen_recall,
         )
+    elif resolved_quality_mode == QUALITY_MODE_ENERGY_CAPTURE:
+        graph_prior_quality_report, quality_fields_by_name = _build_energy_capture_quality_report(
+            result=result,
+            qwen_adjacencies=qwen_adjacencies,
+            random_adjacencies=random_adjacencies,
+            graph_scope=graph_scope,
+            edge_score_name=edge_score_name,
+        )
 
     baseline_matrix = build_baseline_matrix(
         qwen_adjacencies,
         random_adjacencies,
         quality_fields_by_name=quality_fields_by_name,
+    )
+    selected_adjacency_index, v25_handoff_manifest = write_selected_adjacency_artifacts(
+        output_dir=out_dir,
+        source_weight_graph_dir=source_dir,
+        qwen_adjacencies=qwen_adjacencies,
+        graph_scope=graph_scope,
+        edge_score_name=edge_score_name,
+        quality_mode=resolved_quality_mode,
+        has_graph_prior_quality_report=graph_prior_quality_report is not None,
     )
 
     prior_config = {
@@ -518,7 +765,16 @@ def run_graph_prior_eval(
         "quality_dataset": quality_dataset,
         "runtime_protocol": runtime_protocol,
         "memory_protocol": memory_protocol,
-        "graph_prior_quality_protocol": "implanted_signal_recovery" if gold_block_specs is not None else "unavailable",
+        "quality_mode": resolved_quality_mode,
+        "graph_prior_quality_protocol": (
+            "implanted_signal_recovery"
+            if resolved_quality_mode == QUALITY_MODE_IMPLANTED_RECOVERY
+            else "energy_capture_proxy"
+            if resolved_quality_mode == QUALITY_MODE_ENERGY_CAPTURE
+            else "unavailable"
+        ),
+        "selected_adjacency_index": "selected_adjacencies/index.json",
+        "v25_handoff_manifest": "v25_handoff_manifest.json",
         "min_qwen_recall": min_qwen_recall,
         "teacher_checkpoint_loaded": False,
         "champion_scorer_mutated": False,
@@ -537,7 +793,9 @@ def run_graph_prior_eval(
         "graph_prior_quality_ok": None if graph_prior_quality_report is None else bool(graph_prior_quality_report["quality_ok"]),
         "reason": (
             "implanted-signal recovery only; sparse-student task quality is still unavailable"
-            if graph_prior_quality_report is not None
+            if resolved_quality_mode == QUALITY_MODE_IMPLANTED_RECOVERY
+            else "energy-capture proxy only; sparse-student task quality is still unavailable"
+            if resolved_quality_mode == QUALITY_MODE_ENERGY_CAPTURE
             else "v24 P0 graph-prior loader does not run sparse-student quality yet"
         ),
     }
@@ -581,6 +839,8 @@ def run_graph_prior_eval(
         "adjacency_summary": adjacency_summary,
         "quality_report": quality_report,
         "graph_prior_quality_report": graph_prior_quality_report,
+        "selected_adjacency_index": selected_adjacency_index,
+        "v25_handoff_manifest": v25_handoff_manifest,
         "memory_report": memory_report,
         "runtime_report": runtime_report,
         "promotion_decision": promotion_decision,
@@ -602,6 +862,19 @@ def main() -> None:
     parser.add_argument("--quality-dataset", default="")
     parser.add_argument("--runtime-protocol", default="unavailable")
     parser.add_argument("--memory-protocol", default="unavailable")
+    parser.add_argument(
+        "--quality-mode",
+        default=QUALITY_MODE_AUTO,
+        choices=[
+            QUALITY_MODE_AUTO,
+            QUALITY_MODE_UNAVAILABLE,
+            QUALITY_MODE_IMPLANTED_RECOVERY,
+            "implanted_signal_recovery",
+            QUALITY_MODE_ENERGY_CAPTURE,
+            "energy_capture_proxy",
+        ],
+        help="Optional graph-prior quality gate. Use implanted_recovery with --gold-specs or energy_capture without gold specs.",
+    )
     parser.add_argument("--gold-specs", default="", help="Optional JSON gold block specs for implanted-signal recovery.")
     parser.add_argument("--min-qwen-recall", type=float, default=0.95)
     args = parser.parse_args()
@@ -617,6 +890,7 @@ def main() -> None:
         quality_dataset=args.quality_dataset,
         runtime_protocol=args.runtime_protocol,
         memory_protocol=args.memory_protocol,
+        quality_mode=args.quality_mode,
         gold_block_specs=gold_specs,
         min_qwen_recall=args.min_qwen_recall,
     )

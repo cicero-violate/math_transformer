@@ -38,6 +38,26 @@ class RecoveryMetrics:
         }
 
 
+@dataclass(frozen=True)
+class EnergyCaptureMetrics:
+    energy_capture: float
+    energy_capture_ratio: float
+    hit_count: int
+    pred_count: int
+    candidate_edge_count: int
+    candidate_energy_total: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "energy_capture": self.energy_capture,
+            "energy_capture_ratio": self.energy_capture_ratio,
+            "hit_count": self.hit_count,
+            "pred_count": self.pred_count,
+            "candidate_edge_count": self.candidate_edge_count,
+            "candidate_energy_total": self.candidate_energy_total,
+        }
+
+
 def edge_key(src_id: str, relation: str, dst_id: str) -> EdgeKey:
     return (str(src_id), str(relation), str(dst_id))
 
@@ -59,6 +79,90 @@ def recovery_metrics(adjacency: PriorAdjacency, gold_edges: Iterable[EdgeKey]) -
         pred_count=len(pred),
         gold_count=len(gold),
     )
+
+
+def candidate_energy_by_edge_key(candidate_edges: Iterable[Any]) -> dict[EdgeKey, float]:
+    """
+    Build the G0 energy table used by the non-implanted proxy.
+
+    Random matched edges are synthetic. They only capture energy when their
+    sampled (src, relation, dst) key exists in this G0 candidate table.
+    """
+    energy: dict[EdgeKey, float] = {}
+    for edge in candidate_edges:
+        src_id = getattr(edge, "src_id")
+        relation = getattr(edge, "relation", getattr(edge, "rel", ""))
+        dst_id = getattr(edge, "dst_id")
+        weight = max(0.0, float(getattr(edge, "weight", 0.0)))
+        key = edge_key(src_id, relation, dst_id)
+        energy[key] = max(float(energy.get(key, 0.0)), weight)
+    return energy
+
+
+def energy_capture_metrics(
+    adjacency: PriorAdjacency,
+    candidate_energy: dict[EdgeKey, float],
+) -> EnergyCaptureMetrics:
+    pred = adjacency_edge_keys(adjacency)
+    captured = sum(float(candidate_energy.get(key, 0.0)) for key in pred)
+    total = sum(float(v) for v in candidate_energy.values())
+    ratio = captured / total if total > 0.0 else 0.0
+    return EnergyCaptureMetrics(
+        energy_capture=captured,
+        energy_capture_ratio=ratio,
+        hit_count=sum(1 for key in pred if candidate_energy.get(key, 0.0) > 0.0),
+        pred_count=len(pred),
+        candidate_edge_count=len(candidate_energy),
+        candidate_energy_total=total,
+    )
+
+
+def evaluate_prior_energy_capture(
+    *,
+    qwen_adjacency: PriorAdjacency,
+    random_adjacencies: list[PriorAdjacency],
+    candidate_edges: Iterable[Any],
+) -> dict[str, Any]:
+    candidate_energy = candidate_energy_by_edge_key(candidate_edges)
+    qwen_metrics = energy_capture_metrics(qwen_adjacency, candidate_energy)
+    random_metrics = [energy_capture_metrics(adj, candidate_energy) for adj in random_adjacencies]
+    random_energy = [m.energy_capture for m in random_metrics]
+    random_ratio = [m.energy_capture_ratio for m in random_metrics]
+    energy_mean, energy_std = _random_stats(random_energy)
+    ratio_mean, ratio_std = _random_stats(random_ratio)
+    delta_energy = qwen_metrics.energy_capture - energy_mean
+    delta_ratio = qwen_metrics.energy_capture_ratio - ratio_mean
+    quality_ok = delta_ratio > 0.0 and qwen_metrics.energy_capture_ratio > ratio_mean
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "energy_capture_proxy",
+        "adjacency_name": qwen_adjacency.name,
+        "k": qwen_adjacency.k,
+        "quality_ok": quality_ok,
+        "qwen_energy_capture": qwen_metrics.energy_capture,
+        "qwen_energy_capture_ratio": qwen_metrics.energy_capture_ratio,
+        "qwen_hit_count": qwen_metrics.hit_count,
+        "qwen_pred_count": qwen_metrics.pred_count,
+        "random_energy_capture_mean": energy_mean,
+        "random_energy_capture_std": energy_std,
+        "random_energy_capture_ratio_mean": ratio_mean,
+        "random_energy_capture_ratio_std": ratio_std,
+        "random_seed_count": len(random_adjacencies),
+        "delta_energy_capture": delta_energy,
+        "delta_energy_capture_ratio": delta_ratio,
+        "candidate_edge_count": qwen_metrics.candidate_edge_count,
+        "candidate_energy_total": qwen_metrics.candidate_energy_total,
+        "random_rows": [
+            {
+                "adjacency_name": adj.name,
+                "energy_capture": metrics.energy_capture,
+                "energy_capture_ratio": metrics.energy_capture_ratio,
+                "hit_count": metrics.hit_count,
+                "pred_count": metrics.pred_count,
+            }
+            for adj, metrics in zip(random_adjacencies, random_metrics)
+        ],
+    }
 
 
 def gold_edges_from_block_specs(
