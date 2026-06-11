@@ -276,7 +276,12 @@ def _unavailable_baseline_row(name: str, source: str, k: int | None = None) -> d
     }
 
 
-def _adjacency_matrix_row(adjacency: PriorAdjacency) -> dict[str, Any]:
+def _adjacency_matrix_row(
+    adjacency: PriorAdjacency,
+    *,
+    quality_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    fields = dict(quality_fields or {})
     return {
         "adjacency_name": adjacency.name,
         "source": adjacency.source,
@@ -288,21 +293,34 @@ def _adjacency_matrix_row(adjacency: PriorAdjacency) -> dict[str, Any]:
         "affine_acc": UNAVAILABLE_METRIC,
         "memory_mb": UNAVAILABLE_METRIC,
         "block_ms_median": UNAVAILABLE_METRIC,
-        "quality_ok": False,
+        "quality_ok": bool(fields.get("graph_prior_quality_ok", False)),
         "memory_ok": False,
         "speed_ok": False,
-        "metrics_available": False,
+        "metrics_available": bool(fields),
+        **fields,
     }
 
 
-def build_baseline_matrix(qwen_adjacencies: list[PriorAdjacency], random_adjacencies: list[PriorAdjacency]) -> list[dict[str, Any]]:
+def build_baseline_matrix(
+    qwen_adjacencies: list[PriorAdjacency],
+    random_adjacencies: list[PriorAdjacency],
+    *,
+    quality_fields_by_name: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    quality_fields_by_name = quality_fields_by_name or {}
     rows = [
         _unavailable_baseline_row("dense_full", "dense", None),
         _unavailable_baseline_row("hand_topology_k4", "hand", 4),
         _unavailable_baseline_row("learned_topology_k4", "champion", 4),
     ]
-    rows.extend(_adjacency_matrix_row(adj) for adj in random_adjacencies)
-    rows.extend(_adjacency_matrix_row(adj) for adj in qwen_adjacencies)
+    rows.extend(
+        _adjacency_matrix_row(adj, quality_fields=quality_fields_by_name.get(adj.name))
+        for adj in random_adjacencies
+    )
+    rows.extend(
+        _adjacency_matrix_row(adj, quality_fields=quality_fields_by_name.get(adj.name))
+        for adj in qwen_adjacencies
+    )
     return rows
 
 
@@ -337,6 +355,99 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
+def _load_gold_specs(path: str | Path) -> list[dict[str, Any]]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        raw = raw.get("gold_edges", [])
+    if not isinstance(raw, list):
+        raise ValueError("gold spec file must be a JSON list or object with gold_edges")
+    return [dict(item) for item in raw]
+
+
+def _quality_fields_from_report(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {
+        str(report["adjacency_name"]): {
+            "graph_prior_recall_at_k": report["qwen_recall_at_k"],
+            "graph_prior_precision_at_k": report["qwen_precision_at_k"],
+            "graph_prior_hit_count": report["qwen_hit_count"],
+            "graph_prior_pred_count": report["qwen_pred_count"],
+            "graph_prior_gold_edge_count": report["gold_edge_count"],
+            "graph_prior_delta_recovery": report["delta_recovery"],
+            "graph_prior_random_recall_mean": report["random_recall_mean"],
+            "graph_prior_random_recall_std": report["random_recall_std"],
+            "graph_prior_quality_ok": bool(report["quality_ok"]),
+            "graph_prior_metric": "implanted_signal_recovery",
+        }
+    }
+    for row in report.get("random_rows", []) or []:
+        out[str(row["adjacency_name"])] = {
+            "graph_prior_recall_at_k": row["recall_at_k"],
+            "graph_prior_precision_at_k": row["precision_at_k"],
+            "graph_prior_hit_count": row["hit_count"],
+            "graph_prior_pred_count": row["pred_count"],
+            "graph_prior_gold_edge_count": report["gold_edge_count"],
+            "graph_prior_delta_recovery": None,
+            "graph_prior_random_recall_mean": None,
+            "graph_prior_random_recall_std": None,
+            "graph_prior_quality_ok": False,
+            "graph_prior_metric": "implanted_signal_recovery",
+        }
+    return out
+
+
+def _build_graph_prior_quality_report(
+    *,
+    result: WeightGraphResult,
+    qwen_adjacencies: list[PriorAdjacency],
+    random_adjacencies: list[PriorAdjacency],
+    gold_block_specs: list[dict[str, Any]],
+    edge_score_name: str,
+    min_qwen_recall: float,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    from .qwen_graph_prior_quality import (
+        SCHEMA_VERSION as QUALITY_SCHEMA_VERSION,
+        evaluate_prior_recovery,
+        gold_edges_from_block_specs,
+    )
+
+    gold_edges = gold_edges_from_block_specs(result, gold_block_specs, score_name=edge_score_name)
+    reports = []
+    fields_by_name: dict[str, dict[str, Any]] = {}
+    for qwen_adj in qwen_adjacencies:
+        matched_random = [adj for adj in random_adjacencies if adj.k == qwen_adj.k]
+        report = evaluate_prior_recovery(
+            qwen_adjacency=qwen_adj,
+            random_adjacencies=matched_random,
+            gold_edges=gold_edges,
+            min_qwen_recall=min_qwen_recall,
+        )
+        reports.append(report)
+        fields_by_name.update(_quality_fields_from_report(report))
+
+    primary = reports[0] if reports else {
+        "qwen_recall_at_k": 0.0,
+        "qwen_precision_at_k": 0.0,
+        "random_recall_mean": 0.0,
+        "random_recall_std": 0.0,
+        "delta_recovery": 0.0,
+        "quality_ok": False,
+    }
+    aggregate = {
+        "schema_version": QUALITY_SCHEMA_VERSION,
+        "status": "implanted_signal_recovery",
+        "qwen_recall_at_k": primary["qwen_recall_at_k"],
+        "qwen_precision_at_k": primary["qwen_precision_at_k"],
+        "random_recall_mean": primary["random_recall_mean"],
+        "random_recall_std": primary["random_recall_std"],
+        "delta_recovery": primary["delta_recovery"],
+        "quality_ok": bool(primary["quality_ok"]),
+        "primary_adjacency_name": primary.get("adjacency_name"),
+        "gold_edge_count": primary.get("gold_edge_count", len(gold_edges)),
+        "rows": reports,
+    }
+    return aggregate, fields_by_name
+
+
 def run_graph_prior_eval(
     *,
     source_weight_graph_dir: str | Path,
@@ -348,6 +459,8 @@ def run_graph_prior_eval(
     quality_dataset: str = "",
     runtime_protocol: str = "unavailable",
     memory_protocol: str = "unavailable",
+    gold_block_specs: list[dict[str, Any]] | None = None,
+    min_qwen_recall: float = 0.95,
 ) -> dict[str, Any]:
     source_dir = Path(source_weight_graph_dir)
     out_dir = Path(output_dir)
@@ -372,7 +485,24 @@ def run_graph_prior_eval(
         for qwen_adj in qwen_adjacencies
         for seed in seeds
     ]
-    baseline_matrix = build_baseline_matrix(qwen_adjacencies, random_adjacencies)
+
+    graph_prior_quality_report: dict[str, Any] | None = None
+    quality_fields_by_name: dict[str, dict[str, Any]] = {}
+    if gold_block_specs is not None:
+        graph_prior_quality_report, quality_fields_by_name = _build_graph_prior_quality_report(
+            result=result,
+            qwen_adjacencies=qwen_adjacencies,
+            random_adjacencies=random_adjacencies,
+            gold_block_specs=gold_block_specs,
+            edge_score_name=edge_score_name,
+            min_qwen_recall=min_qwen_recall,
+        )
+
+    baseline_matrix = build_baseline_matrix(
+        qwen_adjacencies,
+        random_adjacencies,
+        quality_fields_by_name=quality_fields_by_name,
+    )
 
     prior_config = {
         "schema_version": SCHEMA_VERSION,
@@ -388,6 +518,8 @@ def run_graph_prior_eval(
         "quality_dataset": quality_dataset,
         "runtime_protocol": runtime_protocol,
         "memory_protocol": memory_protocol,
+        "graph_prior_quality_protocol": "implanted_signal_recovery" if gold_block_specs is not None else "unavailable",
+        "min_qwen_recall": min_qwen_recall,
         "teacher_checkpoint_loaded": False,
         "champion_scorer_mutated": False,
     }
@@ -400,9 +532,14 @@ def run_graph_prior_eval(
     }
     quality_report = {
         "schema_version": SCHEMA_VERSION,
-        "status": "quality_not_run",
+        "status": "graph_prior_quality_run" if graph_prior_quality_report is not None else "quality_not_run",
         "promotable": False,
-        "reason": "v24 P0 graph-prior loader does not run sparse-student quality yet",
+        "graph_prior_quality_ok": None if graph_prior_quality_report is None else bool(graph_prior_quality_report["quality_ok"]),
+        "reason": (
+            "implanted-signal recovery only; sparse-student task quality is still unavailable"
+            if graph_prior_quality_report is not None
+            else "v24 P0 graph-prior loader does not run sparse-student quality yet"
+        ),
     }
     memory_report = {
         "schema_version": SCHEMA_VERSION,
@@ -431,6 +568,8 @@ def run_graph_prior_eval(
     _write_csv(out_dir / "baseline_matrix.csv", baseline_matrix)
     _write_json(out_dir / "adjacency_summary.json", adjacency_summary)
     _write_json(out_dir / "quality_report.json", quality_report)
+    if graph_prior_quality_report is not None:
+        _write_json(out_dir / "graph_prior_quality_report.json", graph_prior_quality_report)
     _write_json(out_dir / "memory_report.json", memory_report)
     _write_json(out_dir / "runtime_report.json", runtime_report)
     _write_jsonl(out_dir / "paired_regression_report.jsonl", [])
@@ -441,6 +580,7 @@ def run_graph_prior_eval(
         "baseline_matrix": baseline_matrix,
         "adjacency_summary": adjacency_summary,
         "quality_report": quality_report,
+        "graph_prior_quality_report": graph_prior_quality_report,
         "memory_report": memory_report,
         "runtime_report": runtime_report,
         "promotion_decision": promotion_decision,
@@ -462,8 +602,11 @@ def main() -> None:
     parser.add_argument("--quality-dataset", default="")
     parser.add_argument("--runtime-protocol", default="unavailable")
     parser.add_argument("--memory-protocol", default="unavailable")
+    parser.add_argument("--gold-specs", default="", help="Optional JSON gold block specs for implanted-signal recovery.")
+    parser.add_argument("--min-qwen-recall", type=float, default=0.95)
     args = parser.parse_args()
 
+    gold_specs = _load_gold_specs(args.gold_specs) if args.gold_specs else None
     result = run_graph_prior_eval(
         source_weight_graph_dir=args.source_weight_graph_dir,
         output_dir=args.output_dir,
@@ -474,6 +617,8 @@ def main() -> None:
         quality_dataset=args.quality_dataset,
         runtime_protocol=args.runtime_protocol,
         memory_protocol=args.memory_protocol,
+        gold_block_specs=gold_specs,
+        min_qwen_recall=args.min_qwen_recall,
     )
     print(f"wrote {args.output_dir}")
     print(f"rows={len(result['baseline_matrix'])}")
