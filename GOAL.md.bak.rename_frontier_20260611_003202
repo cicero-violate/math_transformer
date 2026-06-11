@@ -1,10 +1,10 @@
-# Goal — Recurrent Frontier Graph Transformer
+# Goal — Math-Routed Sparse Transformer
 
 ## Objective
 
-Build a recurrent sparse graph transformer that preserves dense/hand-topology quality while using bounded active compute over a persistent world graph.
+Build a math-routed transformer block that preserves dense-model quality while reducing full block latency through symbolic top-K sparse attention.
 
-The near-term target is still to compile large symbolic topology into bounded neighbor tables and beat dense/hand baselines at useful quality. The v21 target adds recurrent frontier expansion: load a small active graph, reason with sparse attention, expand the frontier, prune to budget, and repeat.
+The target is not to process every symbolic edge faster. The target is to compile a large symbolic topology into a bounded neighbor table, run atteention over that selected subset, and beat the dense transformer block at useful quality.
 
 ---
 

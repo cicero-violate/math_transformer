@@ -1,10 +1,9 @@
-# Conclusions — Recurrent Frontier Graph Transformer
+# Conclusions — Math-Routed Sparse Transformer
 
 **Hardware / runtime**: CUDA GPU, 4 CPU threads, Python 3.12.13, Arch Linux  
 **Benchmark path**: CUDA/Triton neighbor-sparse attention through `scripts/benchmark_attention.sh`  
 **Kernel**: `src/triton_attention.py::_nbr_sparse_attn_kernel` and flat-output variant  
-**Current sparse block mode**: cached topology + top-`K` neighbor truncation  
-**v21 architecture name**: Recurrent Frontier Graph Transformer
+**Current sparse block mode**: cached topology + top-`K` neighbor truncation
 
 ---
 

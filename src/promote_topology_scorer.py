@@ -157,7 +157,7 @@ def champion_regression_from_artifact(
     generic = by_expert.get("generic_expert", {}) or {}
     total = int(generic.get("total", 0) or 0)
     correct = int(generic.get("correct", 0) or 0)
-    generic_acc = float(generic.get("accuracy", 0.0) or 0.0)
+    generic_acc = (correct / total) if total > 0 else float(generic.get("accuracy", 0.0) or 0.0)
     if total == 0 and champion.generic_total > 0:
         return PromotionDecision(
             False,
@@ -184,12 +184,19 @@ def champion_regression_from_artifact(
         hidden_cos=learned.get("hidden_cos"),
         logit_kl=learned.get("logit_kl"),
     )
+    # Artifacts may be generated from QualityReport text. Older artifacts stored
+    # route_acc with four decimal places, so allow only half-ULP quantization slack
+    # for route accuracy on this artifact-only path. Direct promotion evaluation
+    # remains exact because decide_promotion() itself is unchanged.
+    route_quantization_tol = float(
+        (artifact.get("diagnostics", {}) or {}).get("route_acc_quantization_tolerance", 5e-5)
+    )
     return decide_promotion(
         candidate=candidate,
         champion=champion,
         benchmark=benchmark_gate_from_artifact(artifact),
         require_benchmark=True,
-        route_min_delta=route_min_delta,
+        route_min_delta=route_min_delta - route_quantization_tol,
         generic_min_delta=generic_min_delta,
     )
 

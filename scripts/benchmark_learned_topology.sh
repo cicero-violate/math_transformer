@@ -39,8 +39,14 @@ BLOCK_TOKEN_CAP_SWEEP="${BLOCK_TOKEN_CAP_SWEEP:-}"
 NATIVE_BLOCK_SPARSE="${NATIVE_BLOCK_SPARSE:-0}"
 TMP_DIR="${TMP_DIR:-runs/benchmarks/learned_topology_tmp}"
 TRACE_OUTPUT="${TRACE_OUTPUT:-}"
+PROTECT_NONCOMMUTATIVE="${PROTECT_NONCOMMUTATIVE:-0}"
+POLARITY_SUMMARY="${POLARITY_SUMMARY:-}"
+POLARITY_ALPHA="${POLARITY_ALPHA:-0.0}"
 ARTIFACT_JSON="${ARTIFACT_JSON:-$TMP_DIR/benchmark_artifact.json}"
 ARTIFACT_JSONL="${ARTIFACT_JSONL:-runs/benchmarks/learned_topology_benchmark_artifacts.jsonl}"
+LOCKED_PROTOCOL_NAME="${LOCKED_PROTOCOL_NAME:-}"
+LOCKED_PROTOCOL_CONFIG="${LOCKED_PROTOCOL_CONFIG:-}"
+LOCKED_PROTOCOL_HASH="${LOCKED_PROTOCOL_HASH:-}"
 mkdir -p "$TMP_DIR"
 
 if [[ -n "$BLOCK_TOKEN_CAP_SWEEP" ]]; then
@@ -177,20 +183,31 @@ if [[ -n "$TRACE_OUTPUT" ]]; then
   TRACE_ARGS+=(--trace-output "$TRACE_OUTPUT")
 fi
 
+GUARD_ARGS=()
+if [[ "$PROTECT_NONCOMMUTATIVE" == "1" ]]; then
+  GUARD_ARGS+=(--protect-noncommutative)
+fi
+if [[ -n "$POLARITY_SUMMARY" ]]; then
+  GUARD_ARGS+=(--polarity-summary "$POLARITY_SUMMARY")
+fi
+if [[ -n "$POLARITY_ALPHA" ]]; then
+  GUARD_ARGS+=(--polarity-alpha "$POLARITY_ALPHA")
+fi
+
 "$PYTHON" -m src.eval --quality --examples "$EXAMPLES" --checkpoint "$CHECKPOINT" \
   --topology-mode middle_preserving_topk --fixed-k "$HAND_K" --middle-bridge-width 1 \
   --quality-k "$HAND_K" --quality-device "$DEVICE" \
-  --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" "${TOPOLOGY_ARGS[@]}" "${TRACE_ARGS[@]}" | tee "$quality_log"
+  --learned-scorer-checkpoint "$SCORER" --learned-k "$LEARNED_K" "${TOPOLOGY_ARGS[@]}" "${GUARD_ARGS[@]}" "${TRACE_ARGS[@]}" | tee "$quality_log"
 
 "$PYTHON" -m src.eval --paired-learned-topology-benchmark --sizes "$BENCH_N" \
   --node-mode "$BENCH_NODE_MODE" --examples "$EXAMPLES" \
   --fixed-k "$HAND_K" --learned-k "$LEARNED_K" \
   --learned-scorer-checkpoint "$SCORER" --middle-bridge-width 1 \
   --warmup 3 --iters "$BENCH_STEPS" --benchmark-seed "$BENCH_SEED" \
-  "${HAND_PAIRED_TRITON_ARGS[@]}" "${LEARNED_PAIRED_TRITON_ARGS[@]}" "${FUSION_ARGS[@]}" "${TOPOLOGY_ARGS[@]}" \
+  "${HAND_PAIRED_TRITON_ARGS[@]}" "${LEARNED_PAIRED_TRITON_ARGS[@]}" "${FUSION_ARGS[@]}" "${TOPOLOGY_ARGS[@]}" "${GUARD_ARGS[@]}" \
   --hand-save-dir "$hand_dir" --learned-save-dir "$learned_dir" >/dev/null
 
-"$PYTHON" - "$quality_log" "$hand_dir" "$learned_dir" "$HAND_K" "$LEARNED_K" "$ALLOW_FAIL" "$ACCEPTANCE_TOL_MS" "$SCORER" "$CHECKPOINT" "$EXAMPLES" "$DEVICE" "$BENCH_N" "$BENCH_NODE_MODE" "$BENCH_STEPS" "$BENCH_SEED" "$ARTIFACT_JSON" "$ARTIFACT_JSONL" "$TMP_DIR" <<'PY2'
+"$PYTHON" - "$quality_log" "$hand_dir" "$learned_dir" "$HAND_K" "$LEARNED_K" "$ALLOW_FAIL" "$ACCEPTANCE_TOL_MS" "$SCORER" "$CHECKPOINT" "$EXAMPLES" "$DEVICE" "$BENCH_N" "$BENCH_NODE_MODE" "$BENCH_STEPS" "$BENCH_SEED" "$ARTIFACT_JSON" "$ARTIFACT_JSONL" "$TMP_DIR" "$LOCKED_PROTOCOL_NAME" "$LOCKED_PROTOCOL_CONFIG" "$LOCKED_PROTOCOL_HASH" "$PROTECT_NONCOMMUTATIVE" "$POLARITY_SUMMARY" "$POLARITY_ALPHA" <<'PY2'
 from __future__ import annotations
 import json, re, sys
 from pathlib import Path
@@ -215,6 +232,12 @@ from src.topology_benchmark_artifact import build_benchmark_artifact, write_arti
     artifact_json,
     artifact_jsonl,
     tmp_dir,
+    locked_protocol_name,
+    locked_protocol_config,
+    locked_protocol_hash,
+    protect_noncommutative,
+    polarity_summary,
+    polarity_alpha,
 ) = sys.argv[1:]
 hand_k_i = int(hand_k); learned_k_i = int(learned_k); allow = allow_fail == "1"
 tol_ms = float(acceptance_tol_ms)
@@ -294,6 +317,12 @@ artifact = build_benchmark_artifact(
         "device": device,
         "topology_mode": learned_mode,
         "acceptance_tolerance_ms": tol_ms,
+        "locked_protocol_name": locked_protocol_name or None,
+        "locked_protocol_config": locked_protocol_config or None,
+        "locked_protocol_hash": locked_protocol_hash or None,
+        "protect_noncommutative": protect_noncommutative == "1",
+        "polarity_summary": polarity_summary or None,
+        "polarity_alpha": float(polarity_alpha or 0.0),
     },
     paths={
         "scorer": scorer,

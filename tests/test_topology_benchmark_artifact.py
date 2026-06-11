@@ -18,8 +18,14 @@ mode=learned_topology  k=8  examples=259  route_acc=0.9900  hidden_cos=0.970000 
 
 def test_build_benchmark_artifact_acceptance():
     quality = """
+mode=full  k=full  examples=259  route_acc=0.9800
+         by_expert generic_expert=225/259(0.8687) affine_expert=296/296(1.0000)
+mode=topology_only  k=4  examples=259  route_acc=0.9927
+         by_expert generic_expert=252/259(0.9730) affine_expert=290/296(0.9797)
 mode=topology_only  k=16  examples=259  route_acc=0.9800
          by_expert generic_expert=230/259(0.8880)
+mode=learned_topology  k=4  examples=259  route_acc=0.9933
+         by_expert generic_expert=253/259(0.9768) affine_expert=290/296(0.9797)
 mode=learned_topology  k=8  examples=259  route_acc=0.9900
          by_expert generic_expert=236/259(0.9112)
 """
@@ -45,3 +51,9 @@ mode=learned_topology  k=8  examples=259  route_acc=0.9900
     assert artifact["acceptance"]["passed"] is True
     assert artifact["quality"]["learned"]["by_expert"]["generic_expert"]["correct"] == 236
     assert artifact["speed"]["speedup"] > 1.0
+    report = artifact["promotion_report"]
+    assert report["quality_policies"]["dense_full"]["route_acc"] == 0.98
+    assert report["quality_policies"]["hand_k4"]["generic_expert"]["correct"] == 252
+    assert report["quality_policies"]["learned_k4"]["affine_expert"]["total"] == 296
+    assert report["quality_policies"]["current_learned_policy"]["k"] == 8
+    assert report["required_quality_policies_present"]["hand_k4"] is True

@@ -1,5 +1,5 @@
 ---
-title: "Recurrent Frontier Graph Transformer — About"
+title: "Math-Routed Sparse Transformer — About"
 geometry: margin=1in
 fontsize: 11pt
 ---
@@ -20,31 +20,29 @@ $$B=\lceil N/b \rceil=\text{number of blocks, block size }b$$
 
 ## What The Program Is Really Called
 
-Current project name:
-
-```
-Recurrent Frontier Graph Transformer
-```
-
-Core mechanism:
-
-```
-Recurrent Frontier Graph Attention
-```
-
-Historical subsystem names:
+Repository name:
 
 ```
 Math-Routed Sparse Transformer
+```
+
+More exact technical name:
+
+```
 Topology-Routed Top-K Sparse Transformer
-Learned Topology Transformer
+```
+
+or:
+
+```
+Symbolic-Topology Routed Sparse Attention Transformer
 ```
 
 Best clean name:
 
-$$\boxed{\text{Recurrent Frontier Graph Transformer}}$$
+$$\boxed{\text{Math-Routed Sparse Transformer}}$$
 
-because the system is now defined by recurrent traversal over a bounded active frontier of a persistent graph. Mathematical expression routing remains the first implemented subsystem.
+because the routing is produced from mathematical expression structure.
 
 ---
 
@@ -308,39 +306,33 @@ block token expansion: compatible with existing PreparedTopology interface
 Use:
 
 ```
-Recurrent Frontier Graph Transformer
+Math-Routed Sparse Transformer
 ```
 
 For the method/concept, say:
 
 ```
-recurrent frontier graph attention
-```
-
-For the current implemented math subsystem, say:
-
-```
-learned / symbolic TopK sparse topology over MathNode graphs
+neurosymbolic topology-routed sparse attention
 ```
 
 For the execution system, say:
 
 ```
-cached TopK graph-routed Triton sparse attention
+cached top-K graph-routed Triton block-token attention
 ```
 
-For the v21 development stage, say:
+For the current development stage, say:
 
 ```
-bounded active graph traversal over a persistent world graph, with verified graph writeback pending
+fixed-K symbolic + learned-block topology with prepared static sparse inference
 ```
 
 Final canonical form:
 
 $$\boxed{
 \begin{array}{c}
-\textbf{Recurrent Frontier Graph Transformer}\\[4pt]
-\text{bounded sparse attention over an active graph frontier}\\
-\text{with persistent world graph memory and verified writeback}
+\textbf{Math-Routed Sparse Transformer}\\[4pt]
+\text{neurosymbolic topology-routed top-K sparse attention}\\
+\text{with learned block-pair topology for scalable } N
 \end{array}
 }$$

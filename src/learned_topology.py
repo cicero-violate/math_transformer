@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,6 +19,9 @@ from .topology import (
     shape_compatibility_matrix,
     symbolic_dependency_matrix,
 )
+
+
+DEFAULT_NONCOMMUTATIVE_OPS: tuple[str, ...] = ("sub", "div", "matmul")
 
 
 FEATURE_NAMES: tuple[str, ...] = (

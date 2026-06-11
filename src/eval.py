@@ -171,6 +171,8 @@ class QualityReport:
     k: int | None
     n_examples: int
     route_accuracy: float
+    correct_count: int | None = None
+    correct_by_example: list[bool] = field(default_factory=list)
     dense_agreement: float | None = None
     hidden_l1: float | None = None
     hidden_cos: float | None = None
@@ -193,12 +195,15 @@ class QualityReport:
             logits += f"  logit_kl={self.logit_kl_dense_to_sparse:.6f}"
         line = (
             f"mode={self.mode}  k={k_str}  examples={self.n_examples}  "
-            f"route_acc={self.route_accuracy:.4f}{agree}{hidden}{logits}"
+            f"route_acc={self.route_accuracy:.6f}"
         )
+        if self.correct_count is not None:
+            line += f"  correct={self.correct_count}/{self.n_examples}"
+        line += f"{agree}{hidden}{logits}"
         if not self.by_expert:
             return line
         details = "  ".join(
-            f"{expert}={stats['correct']}/{stats['total']}({stats['accuracy']:.4f})"
+            f"{expert}={stats['correct']}/{stats['total']}({stats['accuracy']:.6f})"
             for expert, stats in sorted(self.by_expert.items())
         )
         return f"{line}\n         by_expert {details}"
@@ -808,6 +813,9 @@ def run_paired_learned_topology_benchmark(
     block_local_window: int = 1,
     block_token_cap: int = 16,
     native_block_sparse_attn: bool = False,
+    protect_noncommutative: bool = False,
+    polarity_summary: str | None = None,
+    polarity_alpha: float = 0.0,
 ) -> tuple[BenchmarkReport, BenchmarkReport]:
     """Benchmark hand and learned prepared topologies with one shared block/input.
 
@@ -892,6 +900,9 @@ def run_paired_learned_topology_benchmark(
             local_window=local_window,
             middle_bridge_width=middle_bridge_width,
             device=device,
+            protect_noncommutative=protect_noncommutative,
+            polarity_summary=polarity_summary,
+            polarity_alpha=polarity_alpha,
         )
     cache = TopologyCache()
 
@@ -1158,6 +1169,9 @@ def run_quality_eval(
     relation_weights: dict[str, float] | None = None,
     learned_scorer_checkpoint: str | None = None,
     learned_k: int = 8,
+    protect_noncommutative: bool = False,
+    polarity_summary: str | None = None,
+    polarity_alpha: float = 0.0,
     block_size: int = 64,
     topk_blocks: int = 4,
     block_local_window: int = 1,
@@ -1300,6 +1314,8 @@ def run_quality_eval(
             k=None,
             n_examples=len(records),
             route_accuracy=op_accuracy(dense_preds, targets),
+            correct_count=sum(1 for pred, target in zip(dense_preds, targets) if pred == target),
+            correct_by_example=[pred == target for pred, target in zip(dense_preds, targets)],
             dense_agreement=None,
             by_expert=_by_expert(dense_preds),
         )
@@ -1327,6 +1343,8 @@ def run_quality_eval(
                 k=k,
                 n_examples=len(records),
                 route_accuracy=op_accuracy(sparse_preds, targets),
+                correct_count=sum(1 for pred, target in zip(sparse_preds, targets) if pred == target),
+                correct_by_example=[pred == target for pred, target in zip(sparse_preds, targets)],
                 dense_agreement=op_accuracy(sparse_preds, dense_preds),
                 hidden_l1=agreement["hidden_l1"],
                 hidden_cos=agreement["hidden_cos"],
@@ -1371,6 +1389,8 @@ def run_quality_eval(
                 k=learned_k,
                 n_examples=len(records),
                 route_accuracy=op_accuracy(block_preds, targets),
+                correct_count=sum(1 for pred, target in zip(block_preds, targets) if pred == target),
+                correct_by_example=[pred == target for pred, target in zip(block_preds, targets)],
                 dense_agreement=op_accuracy(block_preds, dense_preds),
                 hidden_l1=agreement["hidden_l1"],
                 hidden_cos=agreement["hidden_cos"],
@@ -1397,6 +1417,9 @@ def run_quality_eval(
                 local_window=local_window,
                 middle_bridge_width=middle_bridge_width,
                 device=dev,
+                protect_noncommutative=protect_noncommutative,
+                polarity_summary=polarity_summary,
+                polarity_alpha=polarity_alpha,
             )
             layer.max_neighbors = learned_k
         learned_preds, learned_hiddens, learned_logits = _forward_records(learned, pass_nodes=True)
@@ -1412,6 +1435,8 @@ def run_quality_eval(
                 k=learned_k,
                 n_examples=len(records),
                 route_accuracy=op_accuracy(learned_preds, targets),
+                correct_count=sum(1 for pred, target in zip(learned_preds, targets) if pred == target),
+                correct_by_example=[pred == target for pred, target in zip(learned_preds, targets)],
                 dense_agreement=op_accuracy(learned_preds, dense_preds),
                 hidden_l1=agreement["hidden_l1"],
                 hidden_cos=agreement["hidden_cos"],
@@ -1432,6 +1457,9 @@ def run_quality_eval(
                 local_window=local_window,
                 middle_bridge_width=middle_bridge_width,
                 device=dev,
+                protect_noncommutative=protect_noncommutative,
+                polarity_summary=polarity_summary,
+                polarity_alpha=polarity_alpha,
             )
         hand_builder = TopologyBuilder(
             topk=topk,
@@ -1635,6 +1663,9 @@ def _run_paired_learned_topology_benchmark_cli(args: argparse.Namespace) -> None
         block_local_window=args.block_local_window,
         block_token_cap=args.block_token_cap,
         native_block_sparse_attn=args.native_block_sparse_attn,
+        protect_noncommutative=args.protect_noncommutative,
+        polarity_summary=args.polarity_summary,
+        polarity_alpha=args.polarity_alpha,
     )
     print("paired_prepared_shared_block=true same_input=true same_block_weights=true")
     print(f"fused_norm_qkv={args.profile_fused_norm_qkv} fused_attn_outproj={args.profile_fused_attn_outproj} native_block_sparse_attn={args.native_block_sparse_attn}")
@@ -1710,6 +1741,9 @@ def _run_quality_cli(args: argparse.Namespace) -> None:
         relation_weights=relation_weights,
         learned_scorer_checkpoint=args.learned_scorer_checkpoint,
         learned_k=args.learned_k,
+        protect_noncommutative=args.protect_noncommutative,
+        polarity_summary=args.polarity_summary,
+        polarity_alpha=args.polarity_alpha,
         block_size=args.block_size,
         topk_blocks=args.topk_blocks,
         block_local_window=args.block_local_window,
@@ -1760,6 +1794,9 @@ def main() -> None:
     parser.add_argument("--relation-weights-json", default=None, dest="relation_weights_json")
     parser.add_argument("--learned-scorer-checkpoint", default=None, dest="learned_scorer_checkpoint")
     parser.add_argument("--learned-k", type=int, default=8, dest="learned_k")
+    parser.add_argument("--protect-noncommutative", action="store_true", dest="protect_noncommutative")
+    parser.add_argument("--polarity-summary", default=None, dest="polarity_summary")
+    parser.add_argument("--polarity-alpha", type=float, default=0.0, dest="polarity_alpha")
     parser.add_argument("--block-size", type=int, default=64, dest="block_size")
     parser.add_argument("--topk-blocks", type=int, default=4, dest="topk_blocks")
     parser.add_argument("--block-local-window", type=int, default=1, dest="block_local_window")

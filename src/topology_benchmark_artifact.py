@@ -138,6 +138,97 @@ def pick_quality_row(rows: list[dict[str, Any]], mode: str, k: int) -> dict[str,
     raise ValueError(f"missing quality row mode={mode} k={k}")
 
 
+def _pick_quality_row_optional(rows: list[dict[str, Any]], modes: tuple[str, ...], k: int | str | None) -> dict[str, Any] | None:
+    for row in rows:
+        if row.get("mode") not in modes:
+            continue
+        row_k = row.get("k")
+        if k in {None, "full"}:
+            if row_k in {None, "full"}:
+                return row
+        elif row_k == k:
+            return row
+    return None
+
+
+def _expert_snapshot(row: dict[str, Any] | None, expert: str) -> dict[str, Any] | None:
+    if not row:
+        return None
+    stats = (row.get("by_expert", {}) or {}).get(expert)
+    if not stats:
+        return None
+    return {"correct": stats.get("correct"), "total": stats.get("total"), "accuracy": stats.get("accuracy")}
+
+
+def _quality_snapshot(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "mode": row.get("mode"),
+        "k": row.get("k"),
+        "examples": row.get("examples", row.get("n_examples")),
+        "route_acc": row.get("route_acc"),
+        "correct_count": row.get("correct_count"),
+        "generic_expert": _expert_snapshot(row, "generic_expert"),
+        "affine_expert": _expert_snapshot(row, "affine_expert"),
+        "wins_vs_hand_k4": row.get("wins_vs_hand_k4"),
+        "losses_vs_hand_k4": row.get("losses_vs_hand_k4"),
+        "correct_delta_vs_hand_k4": row.get("correct_delta_vs_hand_k4"),
+        "wins_vs_dense": row.get("wins_vs_dense"),
+        "losses_vs_dense": row.get("losses_vs_dense"),
+        "correct_delta_vs_dense": row.get("correct_delta_vs_dense"),
+    }
+
+
+def build_promotion_report(
+    *,
+    quality_rows: list[dict[str, Any]],
+    hand_k: int,
+    learned_k: int,
+    learned_mode: str,
+    speed: dict[str, Any],
+    repeated_speed_summary: dict[str, Any] | None = None,
+    edge_delta_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    dense = _pick_quality_row_optional(quality_rows, ("full", "dense"), "full")
+    hand_k4 = _pick_quality_row_optional(quality_rows, ("topology_only", "hand"), 4)
+    learned_k4 = _pick_quality_row_optional(quality_rows, ("learned_topology", "learned_block_topk", "learned"), 4)
+    current_hand = _pick_quality_row_optional(quality_rows, ("topology_only", "hand"), hand_k)
+    current_learned = _pick_quality_row_optional(quality_rows, (learned_mode, "learned_topology", "learned_block_topk", "learned"), learned_k)
+    return {
+        "schema_version": "topology_promotion_report.v1",
+        "quality_policies": {
+            "dense_full": _quality_snapshot(dense),
+            "hand_k4": _quality_snapshot(hand_k4),
+            "learned_k4": _quality_snapshot(learned_k4),
+            "current_hand_policy": _quality_snapshot(current_hand),
+            "current_learned_policy": _quality_snapshot(current_learned),
+        },
+        "paired_flips": {
+            "learned_k4_vs_hand_k4": {
+                "wins": None if learned_k4 is None else learned_k4.get("wins_vs_hand_k4"),
+                "losses": None if learned_k4 is None else learned_k4.get("losses_vs_hand_k4"),
+                "net": None if learned_k4 is None else learned_k4.get("correct_delta_vs_hand_k4"),
+            },
+            "current_learned_vs_hand_k4": {
+                "wins": None if current_learned is None else current_learned.get("wins_vs_hand_k4"),
+                "losses": None if current_learned is None else current_learned.get("losses_vs_hand_k4"),
+                "net": None if current_learned is None else current_learned.get("correct_delta_vs_hand_k4"),
+            },
+        },
+        "speed": speed,
+        "repeated_speed_summary": repeated_speed_summary,
+        "edge_delta_summary": edge_delta_summary,
+        "required_quality_policies_present": {
+            "dense_full": dense is not None,
+            "hand_k4": hand_k4 is not None,
+            "learned_k4": learned_k4 is not None,
+            "current_learned_policy": current_learned is not None,
+        },
+    }
+
+
 def bucket_group_stats(hand_buckets: dict[str, Any], learned_buckets: dict[str, Any]) -> dict[str, str]:
     groups = {
         "attention kernel": ["attention_kernel_ms", "attention_outproj_ms"],
@@ -172,8 +263,14 @@ def build_benchmark_artifact(
     config: dict[str, Any] | None = None,
     paths: dict[str, Any] | None = None,
     include_reports: bool = True,
+    quality_sweep_rows: list[dict[str, Any]] | None = None,
+    repeated_speed_summary: dict[str, Any] | None = None,
+    edge_delta_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows = parse_quality_log(quality_log_text)
+    report_rows = list(rows)
+    if quality_sweep_rows:
+        report_rows.extend(quality_sweep_rows)
     learned_mode = learned_mode_from_report(learned_report)
     hand_quality = pick_quality_row(rows, "topology_only", hand_k)
     learned_quality = pick_quality_row(rows, learned_mode, learned_k)
@@ -234,6 +331,15 @@ def build_benchmark_artifact(
         },
         "diagnostics": bucket_group_stats(hand_p, learned_p),
     }
+    artifact["promotion_report"] = build_promotion_report(
+        quality_rows=report_rows,
+        hand_k=hand_k,
+        learned_k=learned_k,
+        learned_mode=learned_mode,
+        speed=artifact["speed"],
+        repeated_speed_summary=repeated_speed_summary,
+        edge_delta_summary=edge_delta_summary,
+    )
     if include_reports:
         artifact["reports"] = {"hand": hand_report, "learned": learned_report}
     return artifact

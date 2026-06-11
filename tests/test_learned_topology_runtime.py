@@ -68,3 +68,52 @@ def test_learned_topology_builder_torch_outputs_capped_mask(tmp_path: Path):
     assert int(mask.sum(dim=1).max().item()) <= 3
     assert torch.all(torch.diag(mask))
     assert priority.dtype == torch.int8
+
+
+def test_guarded_selector_protects_noncommutative_argument_edges():
+    nodes = normalize(parse("div(x, y)")).collect_nodes()
+    scores = torch.zeros(len(nodes), len(nodes))
+    builder = LearnedTopologyBuilder(
+        "unused.pt",
+        fixed_k=1,
+        device="cpu",
+        protect_noncommutative=True,
+    )
+
+    mask = builder._mask_from_scores(nodes, scores, torch.device("cpu"))
+
+    root_idx = next(i for i, node in enumerate(nodes) if node.op == "div")
+    child_indices = [i for i, node in enumerate(nodes) if node.op == "var"]
+    for child_idx in child_indices:
+        assert mask[root_idx, child_idx]
+        assert mask[child_idx, root_idx]
+    assert torch.all(torch.diag(mask))
+
+
+def test_polarity_bias_changes_extra_edge_selection(tmp_path: Path):
+    nodes = normalize(parse("add(mul(x, y), z)")).collect_nodes()
+    n = len(nodes)
+    scores = torch.zeros(n, n)
+    summary = {
+        "edge_kind_polarity": [
+            {"pattern": "extra_edges:mul->leaf", "record_polarity": -1.0},
+            {"pattern": "extra_edges:add->leaf", "record_polarity": 1.0},
+        ]
+    }
+    polarity_path = tmp_path / "polarity.json"
+    polarity_path.write_text(__import__("json").dumps(summary))
+    builder = LearnedTopologyBuilder(
+        "unused.pt",
+        fixed_k=2,
+        device="cpu",
+        polarity_summary=str(polarity_path),
+        polarity_alpha=2.0,
+    )
+
+    mask = builder._mask_from_scores(nodes, scores, torch.device("cpu"))
+
+    add_idx = next(i for i, node in enumerate(nodes) if node.op == "add")
+    mul_idx = next(i for i, node in enumerate(nodes) if node.op == "mul")
+    leaf_indices = [i for i, node in enumerate(nodes) if node.op == "var"]
+    assert any(bool(mask[add_idx, j]) for j in leaf_indices)
+    assert not any(bool(mask[mul_idx, j]) for j in leaf_indices)

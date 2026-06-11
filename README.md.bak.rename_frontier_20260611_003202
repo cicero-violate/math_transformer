@@ -1,8 +1,8 @@
-# Recurrent Frontier Graph Transformer
+# Math-Routed Sparse Transformer
 
-A neurosymbolic sparse graph transformer prototype. The current implemented subsystem converts mathematical expression structure into TopK sparse attention neighborhoods; the v21 target extends this into recurrent frontier expansion over a persistent world graph.
+A neurosymbolic transformer prototype that converts mathematical expression structure into sparse attention neighborhoods, then executes the sparse attention path with a fused CUDA/Triton kernel.
 
-The project has gone through twenty-one planning iterations. The current implemented subsystem is:
+The project has gone through fourteen planning iterations. The current architecture is:
 
 ```text
 math expression graph
@@ -10,17 +10,9 @@ math expression graph
     -> cached neighbor table (offline; O(T*K) hot path)
     -> Triton block-token sparse attention
     -> transformer block
-
-v21 target:
-
-persistent world graph
-    -> bounded active frontier graph
-    -> sparse graph attention
-    -> frontier expansion
-    -> verified graph writeback
 ```
 
-## Proven Results For The Current Math-Topology Subsystem
+## Proven Results
 
 ### Prepared static sparse block beats dense block
 

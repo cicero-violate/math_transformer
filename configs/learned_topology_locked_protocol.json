@@ -1,0 +1,48 @@
+{
+  "schema_version": "learned_topology_locked_protocol.v1",
+  "name": "champion_k8_vs_hand_k16_locked",
+  "description": "Locked champion-gated learned-topology quality and speed protocol.",
+  "paths": {
+    "scorer": "runs/checkpoints/topology_scorer.champion.pt",
+    "champion_metadata": "runs/checkpoints/topology_scorer.champion.json",
+    "checkpoint": "runs/checkpoints/synthetic_hard_dense.pt",
+    "examples": "data/synthetic_hard/val.jsonl",
+    "tmp_dir": "runs/benchmarks/locked_protocol_tmp",
+    "quality_trace": "runs/diagnostics/locked_protocol_quality_traces.jsonl",
+    "artifact_json": "runs/benchmarks/locked_protocol_tmp/benchmark_artifact.json",
+    "artifact_jsonl": "runs/benchmarks/locked_protocol_artifacts.jsonl"
+  },
+  "quality": {
+    "learned_k": 8,
+    "quality_k": 16,
+    "fixed_k": 16,
+    "middle_bridge_width": 1,
+    "device": "auto"
+  },
+  "benchmark": {
+    "hand_k": 16,
+    "learned_k": 8,
+    "bench_n": 1024,
+    "bench_steps": 100,
+    "bench_node_mode": "trees",
+    "bench_seed": 0,
+    "device": "auto",
+    "acceptance_tolerance_ms": 0.05,
+    "allow_fail": 0,
+    "block_topology": 0,
+    "native_block_sparse": 0,
+    "fused_norm_qkv": 0,
+    "fused_attn_outproj": 0
+  },
+  "gates": {
+    "require_quality_ok": true,
+    "require_speed_ok": true,
+    "require_strict_speed_ok": true,
+    "route_min_delta": 0.0,
+    "generic_min_delta": 0.0
+  },
+  "notes": {
+    "hardware": "Record actual runtime hardware in benchmark artifact; do not hard-code machine assumptions here.",
+    "promotion": "Champion checkpoint remains immutable; this protocol only verifies regression gates."
+  }
+}
