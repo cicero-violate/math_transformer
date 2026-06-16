@@ -26,6 +26,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--include-family", action="append", dest="include_families",
+                        metavar="FAMILY", help="Only train on this family (repeatable)")
+    parser.add_argument("--exclude-family", action="append", dest="exclude_families",
+                        metavar="FAMILY", help="Exclude this family from training (repeatable)")
     args = parser.parse_args(argv)
 
     result = train_full_graph_decoder_model(
@@ -42,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         lr=args.lr,
         batch_size=args.batch_size,
         device=args.device,
+        include_families=args.include_families,
+        exclude_families=args.exclude_families,
     )
     print(json.dumps(result["report"], indent=2))
     print(f"\ncheckpoint: {result['checkpoint']}")

@@ -278,15 +278,42 @@ def load_checkpoint(path: str | Path, *, device: str = "cpu") -> tuple[FullGraph
     return model.to(device), tokenizer
 
 
-def _load_examples(teacher_artifacts: str | Path) -> list[dict[str, Any]]:
+LEAK_VOCAB: frozenset[str] = frozenset([
+    "adjacency", "outgoing", "edges", "theta", "v25", "item_",
+    "sparse", "graph", "student", "topology", "bounded",
+])
+
+
+def _load_examples(
+    teacher_artifacts: str | Path,
+    *,
+    include_families: list[str] | None = None,
+    exclude_families: list[str] | None = None,
+) -> list[dict[str, Any]]:
     path = Path(teacher_artifacts) / "distill_examples.jsonl"
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
-            if stripped:
-                rows.append(json.loads(stripped))
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            family = str(row.get("family", ""))
+            if include_families is not None and family not in include_families:
+                continue
+            if exclude_families is not None and family in exclude_families:
+                continue
+            rows.append(row)
     return rows
+
+
+def leakage_rate(text: str) -> float:
+    """Fraction of generated tokens that are forbidden architecture/template tokens."""
+    tokens = TOKEN_RE.findall(text.lower())
+    if not tokens:
+        return 0.0
+    n_leak = sum(1 for t in tokens if t in LEAK_VOCAB or t.startswith("item_"))
+    return n_leak / len(tokens)
 
 
 def _make_sequence(tokenizer: GraphTokenizer, ex: dict[str, Any], block_size: int) -> list[int]:
@@ -330,8 +357,14 @@ def train_full_graph_decoder_model(
     lr: float = 2e-3,
     batch_size: int = 8,
     device: str = "cpu",
+    include_families: list[str] | None = None,
+    exclude_families: list[str] | None = None,
 ) -> dict[str, Any]:
-    examples = _load_examples(teacher_artifacts)
+    examples = _load_examples(
+        teacher_artifacts,
+        include_families=include_families,
+        exclude_families=exclude_families,
+    )
     tokenizer = GraphTokenizer.build(examples)
     adjacency_name, n_graph_nodes, graph_bias = load_adjacency_metadata(adjacency_path, block_size)
     config = FullGraphDecoderConfig(
@@ -394,6 +427,8 @@ def train_full_graph_decoder_model(
         "loss_decreased": losses[-1] < losses[0],
         "loss_curve": losses[::max(1, epochs // 20)],
         "parameter_count": _parameter_count(model),
+        "include_families": include_families,
+        "exclude_families": exclude_families,
         "teacher_checkpoint_loaded": False,
         "raw_weight_payload_in_graph": False,
         "bounded_active_adjacency": True,
@@ -441,13 +476,15 @@ def generate(
                 break
             generated.append(next_id)
             context.append(next_id)
+    text = tokenizer.decode(generated)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "generated_autoregressive",
         "adjacency_name": model.adjacency_name,
         "prompt": prompt,
-        "text": tokenizer.decode(generated),
+        "text": text,
         "token_count": len(generated),
+        "leakage_rate": leakage_rate(text),
         "temperature": temperature,
         "top_p": top_p,
         "seed": seed,
