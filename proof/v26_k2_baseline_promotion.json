@@ -1,0 +1,61 @@
+{
+  "schema_version": "v26_baseline_promotion.v1",
+  "status": "promoted",
+  "decision_date": "2026-06-16",
+  "promoted_topology": "qwen_topk_k2",
+  "k": 2,
+  "source_adjacency_dir": "runs/qwen_distillation_harness/qwen_style_tiny/v25_measured_cli/graph_prior_eval",
+  "role": "v26_rewiring_baseline",
+
+  "promotion_phrase": "Promote qwen_topk_k2 as the current fixed sparse topology candidate for downstream heldout text evaluation and v26 rewiring experiments.",
+
+  "evidence": {
+    "kl_surrogate_proof": {
+      "artifact": "runs/k2_kl_training/v2/k2_kl_comparison_report.json",
+      "kl_before_qwen": 0.5660287434161858,
+      "kl_before_random": 0.6134046881732936,
+      "kl_after_qwen": 0.5492149482806469,
+      "kl_after_random": 0.5977697489005807,
+      "delta_after": -0.04855480061993378,
+      "qwen_wins_after": true,
+      "train_steps": 20,
+      "verdict": "Qwen k=2 topology beats matched random k=2 before and after KL training"
+    },
+    "heldout_text_eval": {
+      "artifact": "runs/v25_01_heldout_eval/qwen_style_tiny/k2_fixed/heldout_eval_report.json",
+      "n_train": 96,
+      "n_heldout": 32,
+      "train_loss_initial": 5.2781146592305195,
+      "train_loss_final": 4.769224196754921,
+      "heldout_loss_mean": 4.404836809118906,
+      "generalization_gap": -0.3643873876360155,
+      "heldout_generalizes": true,
+      "verdict": "Student does not overfit; held-out loss below train loss across all families"
+    },
+    "v25_01_text_smoke": {
+      "artifact": "runs/sparse_student_distill/qwen25-3b-smart/sparse_student/v25_01_qwen25_3b_smart_sparse_smoke/quality_report.json",
+      "delta_teacher_text": 0.5427447624024584,
+      "teacher_text_loss_decreased": true,
+      "verdict": "Text-path training converges on full 128-example set"
+    }
+  },
+
+  "v26_constraints": {
+    "baseline_topology": "qwen_topk_k2",
+    "rewiring_must_beat_baseline": true,
+    "random_baselines_required": true,
+    "promotion_gates_required": ["quality_report", "kl_report", "heldout_report"],
+    "no_edge_mutation_without_full_report": true,
+    "rewiring_branch": "v26",
+    "mix_into_v25_01": false
+  },
+
+  "safety_flags": {
+    "teacher_checkpoint_loaded": false,
+    "raw_weight_payload_in_graph": false,
+    "bounded_active_adjacency": true,
+    "allow_rewiring": false,
+    "promotion_eligible": false,
+    "note": "allow_rewiring and promotion_eligible remain false until v26 rewiring cycle completes its own gate suite"
+  }
+}
