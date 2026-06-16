@@ -1,0 +1,12 @@
+{
+  "allow_rewiring": false,
+  "fixed_adjacency": true,
+  "lr": 0.5,
+  "loss": "teacher_text_sft_plus_task",
+  "plan": "v25.01",
+  "student_family": "sparse graph-native math_transformer student",
+  "student_topology": "A_qwen_fixed",
+  "task_loss_weight": 0.25,
+  "teacher_text_loss_weight": 1.0,
+  "train_steps": 8
+}
